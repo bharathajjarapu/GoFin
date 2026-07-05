@@ -5,7 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"gofin/internal/config"
 	"gofin/internal/metadata"
@@ -15,6 +17,7 @@ import (
 type Scanner struct {
 	Store   *store.Store
 	Meta    metadata.Client
+	scanID  string
 	series  map[string]metadata.Result
 	seasons map[string]metadata.Result
 }
@@ -22,11 +25,15 @@ type Scanner struct {
 var videoExt = map[string]bool{"mkv": true, "mp4": true, "m4v": true, "avi": true, "mov": true, "webm": true}
 var imageExt = map[string]string{"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}
 var epRe = regexp.MustCompile(`(?i)s(\d{1,2})e(\d{1,3})`)
+var providerRe = regexp.MustCompile(`(?i)\[(tmdbid|imdbid|tvdbid)-([^\]]+)\]`)
 
 func (s Scanner) Scan(libs []config.Library, only string) error {
 	if s.series == nil {
 		s.series = map[string]metadata.Result{}
 		s.seasons = map[string]metadata.Result{}
+	}
+	if s.scanID == "" {
+		s.scanID = time.Now().UTC().Format("20060102T150405.000000000Z")
 	}
 	var slibs []store.Library
 	for _, l := range libs {
@@ -51,7 +58,7 @@ func (s Scanner) Scan(libs []config.Library, only string) error {
 
 func (s Scanner) scanLibrary(lib store.Library) error {
 	root := filepath.Clean(lib.Path)
-	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	if err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
 		}
@@ -64,40 +71,58 @@ func (s Scanner) scanLibrary(lib store.Library) error {
 		if err != nil {
 			return nil
 		}
-		if lib.Type == "tvshows" {
-			return s.upsertEpisode(lib, path, rel, ext, info.Size())
+		mtime := info.ModTime().Unix()
+		id := store.StableID("item", path)
+		if s.Store.Unchanged(id, info.Size(), mtime) {
+			if lib.Type == "tvshows" {
+				_ = s.touchEpisodeParents(lib, rel)
+			}
+			return s.Store.TouchItem(id, s.scanID)
 		}
-		name, year := metadata.CleanYear(cleanName(path))
-		it := store.Item{ID: store.StableID("item", path), LibraryID: lib.ID, ParentID: lib.ID, Type: "Movie", Name: name, Path: path, RelativePath: rel, Container: ext, Size: info.Size(), ProductionYear: year}
+		if lib.Type == "tvshows" {
+			return s.upsertEpisode(lib, path, rel, ext, info.Size(), mtime)
+		}
+		raw := cleanName(path)
+		ids := providerIDs(raw)
+		name, year := metadata.CleanYear(cleanProviders(raw))
+		it := store.Item{ID: id, LibraryID: lib.ID, ParentID: lib.ID, Type: "Movie", Name: name, Path: path, RelativePath: rel, Container: ext, Size: info.Size(), MTimeUnix: mtime, ProductionYear: year, LastSeenScan: s.scanID}
 		var md metadata.Result
 		hasMeta := false
-		if md, hasMeta = s.Meta.Movie(name, year); hasMeta {
+		if md, hasMeta = s.movieMeta(name, year, ids); hasMeta {
 			applyMeta(&it, md)
 		}
 		if err := s.Store.UpsertItem(it); err != nil {
 			return err
 		}
 		if hasMeta {
+			if err := s.savePeople(it.ID, md); err != nil {
+				return err
+			}
 			s.saveRemoteImages(it.ID, md)
 		}
 		return s.saveSidecars(it.ID, path)
-	})
+	}); err != nil {
+		return err
+	}
+	return s.Store.CleanupLibrary(lib.ID, s.scanID)
 }
 
-func (s Scanner) upsertEpisode(lib store.Library, path, rel, ext string, size int64) error {
+func (s Scanner) upsertEpisode(lib store.Library, path, rel, ext string, size, mtime int64) error {
 	parts := strings.Split(filepath.ToSlash(rel), "/")
-	seriesName, year := metadata.CleanYear(cleanPart(parts[0]))
+	rawSeriesName := cleanPart(parts[0])
+	ids := providerIDs(rawSeriesName)
+	seriesName, year := metadata.CleanYear(cleanProviders(rawSeriesName))
 	seriesID := store.StableID("series", lib.ID, seriesName)
 	season := 1
 	episode := 0
 	if m := epRe.FindStringSubmatch(filepath.Base(path)); len(m) == 3 {
-		season = atoi(m[1])
-		episode = atoi(m[2])
+		season, _ = strconv.Atoi(m[1])
+		episode, _ = strconv.Atoi(m[2])
 	}
-	seasonName := "Season " + itoa(season)
+	seasonName := "Season " + strconv.Itoa(season)
 	seasonID := store.StableID("season", seriesID, seasonName)
-	series := store.Item{ID: seriesID, LibraryID: lib.ID, ParentID: lib.ID, Type: "Series", Name: seriesName, IsFolder: true, ProductionYear: year}
-	md, hasMeta := s.seriesMeta(seriesName, year)
+	series := store.Item{ID: seriesID, LibraryID: lib.ID, ParentID: lib.ID, Type: "Series", Name: seriesName, IsFolder: true, ProductionYear: year, LastSeenScan: s.scanID}
+	md, hasMeta := s.seriesMeta(seriesName, year, ids)
 	if hasMeta {
 		applyMeta(&series, md)
 	}
@@ -105,12 +130,15 @@ func (s Scanner) upsertEpisode(lib store.Library, path, rel, ext string, size in
 		return err
 	}
 	if hasMeta {
+		if err := s.savePeople(series.ID, md); err != nil {
+			return err
+		}
 		s.saveRemoteImages(series.ID, md)
 	}
 	if err := s.saveFolderSidecars(series.ID, filepath.Join(filepath.Clean(lib.Path), parts[0])); err != nil {
 		return err
 	}
-	seasonItem := store.Item{ID: seasonID, LibraryID: lib.ID, ParentID: seriesID, Type: "Season", Name: seasonName, IsFolder: true, IndexNumber: season}
+	seasonItem := store.Item{ID: seasonID, LibraryID: lib.ID, ParentID: seriesID, Type: "Season", Name: seasonName, IsFolder: true, IndexNumber: season, LastSeenScan: s.scanID}
 	var smd metadata.Result
 	if hasMeta && md.TMDBID != 0 {
 		if got, ok := s.seasonMeta(md.TMDBID, season); ok {
@@ -122,10 +150,15 @@ func (s Scanner) upsertEpisode(lib store.Library, path, rel, ext string, size in
 	if err := s.Store.UpsertItem(seasonItem); err != nil {
 		return err
 	}
+	if len(smd.People) > 0 {
+		if err := s.savePeople(seasonID, smd); err != nil {
+			return err
+		}
+	}
 	if smd.PosterURL != "" {
 		s.saveRemoteImages(seasonID, smd)
 	}
-	it := store.Item{ID: store.StableID("item", path), LibraryID: lib.ID, ParentID: seasonID, Type: "Episode", Name: cleanName(path), Path: path, RelativePath: rel, Container: ext, Size: size, IndexNumber: episode, ParentIndexNumber: season}
+	it := store.Item{ID: store.StableID("item", path), LibraryID: lib.ID, ParentID: seasonID, Type: "Episode", Name: cleanName(path), Path: path, RelativePath: rel, Container: ext, Size: size, MTimeUnix: mtime, IndexNumber: episode, ParentIndexNumber: season, LastSeenScan: s.scanID}
 	var emd metadata.Result
 	if hasMeta && md.TMDBID != 0 && episode != 0 {
 		if got, ok := s.Meta.Episode(md.TMDBID, season, episode); ok {
@@ -138,18 +171,57 @@ func (s Scanner) upsertEpisode(lib store.Library, path, rel, ext string, size in
 	if err := s.Store.UpsertItem(it); err != nil {
 		return err
 	}
+	if len(emd.People) > 0 {
+		if err := s.savePeople(it.ID, emd); err != nil {
+			return err
+		}
+	}
 	if emd.PosterURL != "" {
 		s.saveRemoteImages(it.ID, emd)
 	}
 	return s.saveSidecars(it.ID, path)
 }
 
-func (s Scanner) seriesMeta(name string, year int) (metadata.Result, bool) {
-	key := name + itoa(year)
+func (s Scanner) touchEpisodeParents(lib store.Library, rel string) error {
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	seriesName, _ := metadata.CleanYear(cleanProviders(cleanPart(parts[0])))
+	seriesID := store.StableID("series", lib.ID, seriesName)
+	season := 1
+	if m := epRe.FindStringSubmatch(filepath.Base(rel)); len(m) == 3 {
+		season, _ = strconv.Atoi(m[1])
+	}
+	if err := s.Store.TouchItem(seriesID, s.scanID); err != nil {
+		return err
+	}
+	return s.Store.TouchItem(store.StableID("season", seriesID, "Season "+strconv.Itoa(season)), s.scanID)
+}
+
+func (s Scanner) movieMeta(name string, year int, ids map[string]string) (metadata.Result, bool) {
+	if id, _ := strconv.Atoi(ids["tmdbid"]); id != 0 {
+		return s.Meta.MovieByID(id)
+	}
+	if id := ids["imdbid"]; id != "" {
+		return s.Meta.MovieByIMDB(id)
+	}
+	return s.Meta.Movie(name, year)
+}
+
+func (s Scanner) seriesMeta(name string, year int, ids map[string]string) (metadata.Result, bool) {
+	key := name + strconv.Itoa(year) + ids["tmdbid"] + ids["imdbid"]
 	if md, ok := s.series[key]; ok {
 		return md, md.TMDBID != 0
 	}
-	md, ok := s.Meta.Series(name, year)
+	var md metadata.Result
+	var ok bool
+	if id, _ := strconv.Atoi(ids["tmdbid"]); id != 0 {
+		md, ok = s.Meta.SeriesByID(id)
+	} else if id := ids["imdbid"]; id != "" {
+		md, ok = s.Meta.SeriesByIMDB(id)
+	} else if id := ids["tvdbid"]; id != "" {
+		md, ok = s.Meta.SeriesByTVDB(id)
+	} else {
+		md, ok = s.Meta.Series(name, year)
+	}
 	if ok {
 		s.series[key] = md
 	}
@@ -157,7 +229,7 @@ func (s Scanner) seriesMeta(name string, year int) (metadata.Result, bool) {
 }
 
 func (s Scanner) seasonMeta(seriesID, season int) (metadata.Result, bool) {
-	key := itoa(seriesID) + ":" + itoa(season)
+	key := strconv.Itoa(seriesID) + ":" + strconv.Itoa(season)
 	if md, ok := s.seasons[key]; ok {
 		return md, md.TMDBID != 0
 	}
@@ -181,7 +253,7 @@ func applyMeta(it *store.Item, md metadata.Result) {
 	if md.Year != 0 {
 		it.ProductionYear = md.Year
 	}
-	it.ProviderIDsJSON = metadata.ProviderIDs(md.TMDBID)
+	it.ProviderIDsJSON = metadata.ProviderIDs(md.TMDBID, md.IMDBID)
 	it.GenresJSON = store.JSON(md.Genres)
 	it.StudiosJSON = store.JSON(md.Studios)
 	it.PeopleJSON = store.JSON(md.People)
@@ -199,6 +271,14 @@ func (s Scanner) saveRemoteImages(id string, md metadata.Result) {
 	if md.BackdropURL != "" {
 		_ = s.Store.UpsertImage(store.Image{ItemID: id, Type: "Backdrop", Index: 0, Path: md.BackdropURL, Tag: store.StableID(md.BackdropURL), Mime: "image/jpeg"})
 	}
+}
+
+func (s Scanner) savePeople(id string, md metadata.Result) error {
+	people := make([]store.Person, 0, len(md.People))
+	for i, p := range md.People {
+		people = append(people, store.Person{TMDBID: p.TMDBID, Name: p.Name, Role: p.Type, Character: p.Role, ProfileURL: p.ProfileURL, SortOrder: i})
+	}
+	return s.Store.SavePeople(id, people)
 }
 
 func (s Scanner) saveSidecars(id, video string) error {
@@ -228,25 +308,14 @@ func cleanPart(s string) string {
 	s = strings.NewReplacer(".", " ", "_", " ", "-", " ").Replace(s)
 	return strings.Join(strings.Fields(s), " ")
 }
+func cleanProviders(s string) string {
+	return strings.Join(strings.Fields(providerRe.ReplaceAllString(s, "")), " ")
+}
+func providerIDs(s string) map[string]string {
+	out := map[string]string{}
+	for _, m := range providerRe.FindAllStringSubmatch(s, -1) {
+		out[strings.ToLower(m[1])] = strings.TrimSpace(m[2])
+	}
+	return out
+}
 func exists(p string) bool { _, err := os.Stat(p); return err == nil }
-func atoi(s string) int {
-	n := 0
-	for _, r := range s {
-		if r < '0' || r > '9' {
-			return n
-		}
-		n = n*10 + int(r-'0')
-	}
-	return n
-}
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	b := []byte{}
-	for n > 0 {
-		b = append([]byte{byte('0' + n%10)}, b...)
-		n /= 10
-	}
-	return string(b)
-}

@@ -1,134 +1,94 @@
 # GoFin
 
-GoFin is a small Go media server that aims to be compatible with Jellyfin clients like Plezy.
+GoFin is a small Go media server compatible with Jellyfin clients like Plezy.
 
-It is built for a simple home/LAN setup:
+Built for a simple home/LAN setup — Movies and TV shows, direct playback, SQLite, TMDB metadata.
 
-- Movies and TV shows
-- Direct playback only
-- SQLite catalog
-- TMDB metadata
-- Jellyfin-style API responses
-- No transcoding
-- No FFmpeg requirement for now
-
-## Status
-
-GoFin is an early base build. It can scan media, store items in SQLite, authenticate users, and serve files directly to Jellyfin-compatible clients.
-
-Current focus:
-
-- rich movie metadata
-- Plezy compatibility
-- simple TV show browsing
-- keeping the code small and easy to understand
-
-## Requirements
-
-- Go
-- SQLite through `github.com/mattn/go-sqlite3`
-- CGO enabled
-- C compiler/build tools
-- TMDB API key for metadata
-
-On Linux/WSL, install build tools first:
+## Quick start
 
 ```sh
-sudo apt update
-sudo apt install build-essential
+# Build
+go build -o gofin ./cmd/gofin
+
+# Init config and set your TMDB key
+./gofin config init
+export TMDB_API_KEY="your-tmdb-key"
+
+# Add a user (admin by default, or use --child for restricted access)
+./gofin user add --name bharath --password 5522
+
+# Scan libraries
+./gofin scan --config gofin.json
+
+# Serve
+./gofin serve --config gofin.json
+# → http://127.0.0.1:8096
 ```
+
+## Features
+
+- **Rich metadata** — posters, backdrops, cast (up to 15), crew, genres, studios, ratings, runtime, taglines, external links (TMDB/IMDb)
+- **TV show support** — series, seasons, episodes with full metadata
+- **Smart scanning** — incremental rescans (skips unchanged files by size+mtime), auto-removes deleted files, background scan loop
+- **Exact provider IDs** — `[tmdbid-438631]`, `[imdbid-tt1160419]`, `[tvdbid-12345]` in filenames for zero-guess matching
+- **People database** — cast/crew stored in SQLite with TMDB profile images, lazy-loaded biographies
+- **Search** — ranked `/Search/Hints` across items and people with prefix-priority matching
+- **User system** — admin accounts, child accounts with parental rating controls (G→NC-17), per-user favorites and playback state
+- **Sessions** — device-aware auth tokens, session listing, logout
+- **Playback progress** — resume, played/unplayed tracking, play count
+- **Favorites** — add/remove favorites, filter by favorites
+- **Next Up** — unwatched episode queue for TV shows
+- **Filters** — by genre, rating, year, person, name prefix, favorites, played state
+- **Jellyfin API compatibility** — endpoints for /Items, /Shows, /Persons, /Search/Hints, /Sessions, /PlaybackInfo, streaming, images, and more
+- **No transcoding** — direct-play only, no FFmpeg required
 
 ## Configuration
-
-Create a config file:
-
-```sh
-./gofin config init
-```
-
-Set your TMDB key in the environment instead of storing it in config:
-
-```sh
-export TMDB_API_KEY="your-tmdb-key"
-```
-
-Example library path:
 
 ```json
 {
   "libraries": [
-    {
-      "name": "Movies",
-      "type": "movies",
-      "path": "/home/bharath/media/movies"
-    }
-  ]
+    { "name": "Movies", "type": "movies", "path": "/data/movies" },
+    { "name": "TV", "type": "tvshows", "path": "/data/tv" }
+  ],
+  "scan": {
+    "on_start": false,
+    "interval_minutes": 0,
+    "workers": 4
+  }
 }
 ```
 
-## Build
-
-```sh
-CGO_ENABLED=1 go build -o gofin ./cmd/gofin
-```
-
-## Add a user
-
-```sh
-./gofin user add --config gofin.json --name bharath --password 5522
-```
-
-## Scan media
-
-```sh
-export TMDB_API_KEY="your-tmdb-key"
-./gofin scan --config gofin.json
-```
-
-## Serve
-
-```sh
-./gofin serve --config gofin.json
-```
-
-Default address:
-
-```text
-http://127.0.0.1:8096
-```
-
-For LAN/Windows/WSL testing, use the configured public URL or your Windows LAN IP.
+Set `TMDB_API_KEY` in the environment.
 
 ## Recommended naming
 
-Use Jellyfin/Plex-style names for best metadata matching:
-
 ```text
 Movies/Dune (2021).mkv
-Movies/Dune Part Two (2024).mkv
-TV Shows/Example Show (2024)/Season 01/Example Show S01E01.mkv
+Movies/Dune Part Two (2024) [tmdbid-438631].mkv
+TV/Example Show (2024)/Season 01/Example Show S01E01.mkv
 ```
 
-Provider IDs can be added later for exact matching:
-
-```text
-Dune (2021) [tmdbid-438631].mkv
-```
-
-## Test
+## User types
 
 ```sh
-CGO_ENABLED=1 go test ./...
+# Admin (full access)
+./gofin user add --name admin --password pass --admin
+
+# Child (content filtered by rating)
+./gofin user add --name kid --password pass --child --max-rating 3
 ```
 
-## What GoFin does not do yet
+Rating levels: G=1, PG=2, PG-13/TV-14=3, R/TV-MA=4, NC-17=5.
 
-- transcoding
-- FFmpeg probing
-- trickplay thumbnails
-- fuzzy metadata matching
-- music libraries
-- full Jellyfin server replacement
-- full Plex server API
+## Why not Jellyfin?
 
-The goal is to stay small, fast, and useful for direct-play movie and TV libraries.
+GoFin is not a full Jellyfin replacement. It intentionally omits:
+
+- **Transcoding**
+- **FFmpeg probing** (no codec/stream analysis yet)
+- **Music libraries**
+- **Plugin system**
+- **Multiple metadata providers** (TMDB only)
+- **Fuzzy metadata matching**
+
+The goal is a small, fast, reliable direct-play server for movie and TV libraries.

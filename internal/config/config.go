@@ -14,7 +14,6 @@ type Config struct {
 	Libraries []Library `json:"libraries"`
 	Scan      Scan      `json:"scan"`
 	Metadata  Metadata  `json:"metadata"`
-	Auth      Auth      `json:"auth"`
 }
 
 type Server struct {
@@ -35,19 +34,14 @@ type Library struct {
 }
 
 type Scan struct {
-	OnStart bool `json:"on_start"`
-	Workers int  `json:"workers"`
+	OnStart         bool `json:"on_start"`
+	IntervalMinutes int  `json:"interval_minutes"`
 }
 
 type Metadata struct {
 	Enabled   bool   `json:"enabled"`
-	Provider  string `json:"provider"`
 	APIKeyEnv string `json:"api_key_env"`
 	Language  string `json:"language"`
-}
-
-type Auth struct {
-	AllowPublicUsers bool `json:"allow_public_users"`
 }
 
 func Default() Config {
@@ -55,9 +49,7 @@ func Default() Config {
 		Server:    Server{Name: "GoFin", ID: randID(), Address: "0.0.0.0:8096"},
 		Database:  Database{Path: "gofin.db"},
 		Libraries: []Library{{Name: "Movies", Type: "movies", Path: "/media/Movies"}, {Name: "TV Shows", Type: "tvshows", Path: "/media/TV"}},
-		Scan:      Scan{Workers: 2},
-		Metadata:  Metadata{Enabled: true, Provider: "tmdb", APIKeyEnv: "TMDB_API_KEY", Language: "en-US"},
-		Auth:      Auth{AllowPublicUsers: true},
+		Metadata:  Metadata{Enabled: true, APIKeyEnv: "TMDB_API_KEY", Language: "en-US"},
 	}
 }
 
@@ -98,12 +90,6 @@ func Fill(c *Config) {
 	}
 	if c.Database.Path == "" {
 		c.Database.Path = "gofin.db"
-	}
-	if c.Scan.Workers <= 0 {
-		c.Scan.Workers = 2
-	}
-	if c.Metadata.Provider == "" {
-		c.Metadata.Provider = "tmdb"
 	}
 	if c.Metadata.APIKeyEnv == "" {
 		c.Metadata.APIKeyEnv = "TMDB_API_KEY"

@@ -2,7 +2,6 @@ package metadata
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/url"
 	"os"
@@ -21,7 +20,9 @@ type Client struct {
 }
 
 type Person struct {
-	Name, Role, Type string
+	Name, Role, Type, ProfileURL, IMDBID                           string
+	Biography, BirthDate, DeathDate, PlaceOfBirth, KnownDepartment string
+	TMDBID                                                         int
 }
 
 type ExternalURL struct {
@@ -37,10 +38,11 @@ type Result struct {
 	CommunityRating                                      float64
 	RuntimeTicks                                         int64
 	Year, Season, Episode, TMDBID                        int
+	IMDBID                                               string
 }
 
 func New(c config.Metadata) Client {
-	return Client{Enabled: c.Enabled && c.Provider == "tmdb", Key: os.Getenv(c.APIKeyEnv), Lang: c.Language, HTTP: &http.Client{Timeout: 8 * time.Second}}
+	return Client{Enabled: c.Enabled, Key: os.Getenv(c.APIKeyEnv), Lang: c.Language, HTTP: &http.Client{Timeout: 8 * time.Second}}
 }
 
 func (c Client) Movie(name string, year int) (Result, bool) {
@@ -53,6 +55,29 @@ func (c Client) Movie(name string, year int) (Result, bool) {
 	}
 	return r, true
 }
+func (c Client) MovieByID(id int) (Result, bool)  { return c.movieDetails(id) }
+func (c Client) SeriesByID(id int) (Result, bool) { return c.seriesDetails(id) }
+func (c Client) MovieByIMDB(id string) (Result, bool) {
+	tmdb, kind, ok := c.findByExternalID(id, "imdb_id")
+	if !ok || kind != "movie" {
+		return Result{}, false
+	}
+	return c.movieDetails(tmdb)
+}
+func (c Client) SeriesByIMDB(id string) (Result, bool) {
+	tmdb, kind, ok := c.findByExternalID(id, "imdb_id")
+	if !ok || kind != "tv" {
+		return Result{}, false
+	}
+	return c.seriesDetails(tmdb)
+}
+func (c Client) SeriesByTVDB(id string) (Result, bool) {
+	tmdb, kind, ok := c.findByExternalID(id, "tvdb_id")
+	if !ok || kind != "tv" {
+		return Result{}, false
+	}
+	return c.seriesDetails(tmdb)
+}
 func (c Client) Series(name string, year int) (Result, bool) {
 	r, ok := c.search("tv", name, year)
 	if !ok || r.TMDBID == 0 {
@@ -62,6 +87,18 @@ func (c Client) Series(name string, year int) (Result, bool) {
 		return d, true
 	}
 	return r, true
+}
+func (c Client) PersonDetails(id int) (Person, bool) {
+	var b personBody
+	if !c.get("person/"+strconv.Itoa(id), "external_ids", &b) {
+		return Person{}, false
+	}
+	p := Person{Name: b.Name, TMDBID: b.ID, Biography: b.Biography, BirthDate: b.Birthday, DeathDate: b.Deathday, PlaceOfBirth: b.PlaceOfBirth, KnownDepartment: b.KnownForDepartment}
+	if b.ProfilePath != "" {
+		p.ProfileURL = imageURL(b.ProfilePath)
+	}
+	p.IMDBID = b.ExternalIDs.IMDBID
+	return p, true
 }
 func (c Client) Season(seriesID, season int) (Result, bool) {
 	var b seasonBody
@@ -84,16 +121,20 @@ func (c Client) Episode(seriesID, season, episode int) (Result, bool) {
 	if b.StillPath != "" {
 		r.PosterURL = imageURL(b.StillPath)
 	}
+	r.IMDBID = b.ExternalIDs.IMDBID
 	for i, p := range b.Credits.Cast {
-		if i == 10 {
+		if i == 15 {
 			break
 		}
-		r.People = append(r.People, Person{Name: p.Name, Role: p.Character, Type: "Actor"})
+		r.People = append(r.People, person(p.ID, p.Name, p.Character, "Actor", p.ProfilePath))
 	}
 	for _, p := range b.Credits.Crew {
 		if p.Job == "Director" || p.Job == "Writer" || p.Job == "Screenplay" {
-			r.People = append(r.People, Person{Name: p.Name, Role: p.Job, Type: p.Job})
+			r.People = append(r.People, person(p.ID, p.Name, p.Job, p.Job, p.ProfilePath))
 		}
+	}
+	if r.IMDBID != "" {
+		r.ExternalURLs = append(r.ExternalURLs, ExternalURL{Name: "IMDb", URL: "https://www.imdb.com/title/" + r.IMDBID + "/"})
 	}
 	return r, true
 }
@@ -142,12 +183,34 @@ func (c Client) search(kind, name string, year int) (Result, bool) {
 	return r, true
 }
 
+func (c Client) findByExternalID(id, source string) (int, string, bool) {
+	var b struct {
+		Movie []struct {
+			ID int `json:"id"`
+		} `json:"movie_results"`
+		TV []struct {
+			ID int `json:"id"`
+		} `json:"tv_results"`
+	}
+	if !c.getValues("find/"+url.PathEscape(id), url.Values{"external_source": {source}}, &b) {
+		return 0, "", false
+	}
+	if len(b.Movie) > 0 {
+		return b.Movie[0].ID, "movie", true
+	}
+	if len(b.TV) > 0 {
+		return b.TV[0].ID, "tv", true
+	}
+	return 0, "", false
+}
+
 func (c Client) movieDetails(id int) (Result, bool) {
 	var b movieBody
 	if !c.get("movie/"+strconv.Itoa(id), "credits,external_ids,release_dates", &b) {
 		return Result{}, false
 	}
 	r := Result{Name: b.Title, Overview: b.Overview, PremiereDate: b.ReleaseDate, TMDBID: b.ID, CommunityRating: b.VoteAverage, OfficialRating: b.certification()}
+	r.IMDBID = b.ExternalIDs.IMDBID
 	r.Year = yearFromDate(r.PremiereDate)
 	r.RuntimeTicks = int64(b.Runtime) * 60 * 10000000
 	if b.Tagline != "" {
@@ -166,19 +229,19 @@ func (c Client) movieDetails(id int) (Result, bool) {
 		r.Studios = append(r.Studios, s.Name)
 	}
 	for i, p := range b.Credits.Cast {
-		if i == 10 {
+		if i == 15 {
 			break
 		}
-		r.People = append(r.People, Person{Name: p.Name, Role: p.Character, Type: "Actor"})
+		r.People = append(r.People, person(p.ID, p.Name, p.Character, "Actor", p.ProfilePath))
 	}
 	for _, p := range b.Credits.Crew {
 		if p.Job == "Director" || p.Job == "Writer" || p.Job == "Screenplay" {
-			r.People = append(r.People, Person{Name: p.Name, Role: p.Job, Type: p.Job})
+			r.People = append(r.People, person(p.ID, p.Name, p.Job, p.Job, p.ProfilePath))
 		}
 	}
 	r.ExternalURLs = append(r.ExternalURLs, ExternalURL{Name: "TheMovieDb", URL: "https://www.themoviedb.org/movie/" + strconv.Itoa(id)})
-	if b.ExternalIDs.IMDBID != "" {
-		r.ExternalURLs = append(r.ExternalURLs, ExternalURL{Name: "IMDb", URL: "https://www.imdb.com/title/" + b.ExternalIDs.IMDBID + "/"})
+	if r.IMDBID != "" {
+		r.ExternalURLs = append(r.ExternalURLs, ExternalURL{Name: "IMDb", URL: "https://www.imdb.com/title/" + r.IMDBID + "/"})
 	}
 	return r, true
 }
@@ -189,6 +252,7 @@ func (c Client) seriesDetails(id int) (Result, bool) {
 		return Result{}, false
 	}
 	r := Result{Name: b.Name, Overview: b.Overview, PremiereDate: b.FirstAirDate, TMDBID: b.ID, CommunityRating: b.VoteAverage, OfficialRating: b.contentRating()}
+	r.IMDBID = b.ExternalIDs.IMDBID
 	r.Year = yearFromDate(r.PremiereDate)
 	if len(b.Runtimes) > 0 {
 		r.RuntimeTicks = int64(b.Runtimes[0]) * 60 * 10000000
@@ -206,34 +270,40 @@ func (c Client) seriesDetails(id int) (Result, bool) {
 		r.Studios = append(r.Studios, n.Name)
 	}
 	for i, p := range b.Credits.Cast {
-		if i == 10 {
+		if i == 15 {
 			break
 		}
 		role := ""
 		if len(p.Roles) > 0 {
 			role = p.Roles[0].Character
 		}
-		r.People = append(r.People, Person{Name: p.Name, Role: role, Type: "Actor"})
+		r.People = append(r.People, person(p.ID, p.Name, role, "Actor", p.ProfilePath))
 	}
 	for _, p := range b.Creators {
-		r.People = append(r.People, Person{Name: p.Name, Role: "Creator", Type: "Creator"})
+		r.People = append(r.People, person(p.ID, p.Name, "Creator", "Creator", p.ProfilePath))
 	}
 	r.ExternalURLs = append(r.ExternalURLs, ExternalURL{Name: "TheMovieDb", URL: "https://www.themoviedb.org/tv/" + strconv.Itoa(id)})
-	if b.ExternalIDs.IMDBID != "" {
-		r.ExternalURLs = append(r.ExternalURLs, ExternalURL{Name: "IMDb", URL: "https://www.imdb.com/title/" + b.ExternalIDs.IMDBID + "/"})
+	if r.IMDBID != "" {
+		r.ExternalURLs = append(r.ExternalURLs, ExternalURL{Name: "IMDb", URL: "https://www.imdb.com/title/" + r.IMDBID + "/"})
 	}
 	return r, true
 }
 
 func (c Client) get(path, appendTo string, v any) bool {
-	if !c.Enabled || c.Key == "" {
-		return false
-	}
-	q := url.Values{"api_key": {c.Key}, "language": {c.Lang}}
+	q := url.Values{}
 	if appendTo != "" {
 		q.Set("append_to_response", appendTo)
 	}
-	res, err := c.HTTP.Get("https://api.themoviedb.org/3/" + path + "?" + q.Encode())
+	return c.getValues(path, q, v)
+}
+
+func (c Client) getValues(path string, values url.Values, v any) bool {
+	if !c.Enabled || c.Key == "" {
+		return false
+	}
+	values.Set("api_key", c.Key)
+	values.Set("language", c.Lang)
+	res, err := c.HTTP.Get("https://api.themoviedb.org/3/" + path + "?" + values.Encode())
 	if err != nil {
 		return false
 	}
@@ -241,14 +311,27 @@ func (c Client) get(path, appendTo string, v any) bool {
 	return res.StatusCode/100 == 2 && json.NewDecoder(res.Body).Decode(v) == nil
 }
 
-func ProviderIDs(tmdb int) string {
-	if tmdb == 0 {
+func ProviderIDs(tmdb int, imdb string) string {
+	if tmdb == 0 && imdb == "" {
 		return ""
 	}
-	return fmt.Sprintf(`{"Tmdb":"%d"}`, tmdb)
+	ids := map[string]string{}
+	if tmdb != 0 {
+		ids["Tmdb"] = strconv.Itoa(tmdb)
+	}
+	if imdb != "" {
+		ids["Imdb"] = imdb
+	}
+	b, _ := json.Marshal(ids)
+	return string(b)
 }
 
 type named struct{ Name string }
+type personRef struct {
+	ID          int    `json:"id"`
+	Name        string `json:"name"`
+	ProfilePath string `json:"profile_path"`
+}
 
 type movieBody struct {
 	ID           int     `json:"id"`
@@ -263,8 +346,8 @@ type movieBody struct {
 	Genres       []named `json:"genres"`
 	Studios      []named `json:"production_companies"`
 	Credits      struct {
-		Cast []struct{ Name, Character string } `json:"cast"`
-		Crew []struct{ Name, Job string }       `json:"crew"`
+		Cast []credit `json:"cast"`
+		Crew []credit `json:"crew"`
 	} `json:"credits"`
 	ExternalIDs struct {
 		IMDBID string `json:"imdb_id"`
@@ -280,21 +363,23 @@ type movieBody struct {
 }
 
 type seriesBody struct {
-	ID           int     `json:"id"`
-	Name         string  `json:"name"`
-	Overview     string  `json:"overview"`
-	FirstAirDate string  `json:"first_air_date"`
-	PosterPath   string  `json:"poster_path"`
-	BackdropPath string  `json:"backdrop_path"`
-	VoteAverage  float64 `json:"vote_average"`
-	Runtimes     []int   `json:"episode_run_time"`
-	Genres       []named `json:"genres"`
-	Networks     []named `json:"networks"`
-	Creators     []named `json:"created_by"`
+	ID           int         `json:"id"`
+	Name         string      `json:"name"`
+	Overview     string      `json:"overview"`
+	FirstAirDate string      `json:"first_air_date"`
+	PosterPath   string      `json:"poster_path"`
+	BackdropPath string      `json:"backdrop_path"`
+	VoteAverage  float64     `json:"vote_average"`
+	Runtimes     []int       `json:"episode_run_time"`
+	Genres       []named     `json:"genres"`
+	Networks     []named     `json:"networks"`
+	Creators     []personRef `json:"created_by"`
 	Credits      struct {
 		Cast []struct {
-			Name  string
-			Roles []struct{ Character string } `json:"roles"`
+			ID          int                          `json:"id"`
+			Name        string                       `json:"name"`
+			ProfilePath string                       `json:"profile_path"`
+			Roles       []struct{ Character string } `json:"roles"`
 		} `json:"cast"`
 	} `json:"aggregate_credits"`
 	ExternalIDs struct {
@@ -324,9 +409,34 @@ type episodeBody struct {
 	StillPath string `json:"still_path"`
 	Runtime   int    `json:"runtime"`
 	Credits   struct {
-		Cast []struct{ Name, Character string } `json:"cast"`
-		Crew []struct{ Name, Job string }       `json:"crew"`
+		Cast []credit `json:"cast"`
+		Crew []credit `json:"crew"`
 	} `json:"credits"`
+	ExternalIDs struct {
+		IMDBID string `json:"imdb_id"`
+	} `json:"external_ids"`
+}
+
+type credit struct {
+	ID          int    `json:"id"`
+	Name        string `json:"name"`
+	Character   string `json:"character"`
+	Job         string `json:"job"`
+	ProfilePath string `json:"profile_path"`
+}
+
+type personBody struct {
+	ID                 int    `json:"id"`
+	Name               string `json:"name"`
+	Biography          string `json:"biography"`
+	Birthday           string `json:"birthday"`
+	Deathday           string `json:"deathday"`
+	PlaceOfBirth       string `json:"place_of_birth"`
+	KnownForDepartment string `json:"known_for_department"`
+	ProfilePath        string `json:"profile_path"`
+	ExternalIDs        struct {
+		IMDBID string `json:"imdb_id"`
+	} `json:"external_ids"`
 }
 
 func (b movieBody) certification() string {
@@ -353,8 +463,15 @@ func (b seriesBody) contentRating() string {
 }
 
 func imageURL(p string) string { return "https://image.tmdb.org/t/p/original" + p }
-func str(v any) string         { s, _ := v.(string); return s }
-func num(v any) int            { f, _ := v.(float64); return int(f) }
+func person(id int, name, role, typ, profile string) Person {
+	p := Person{Name: name, Role: role, Type: typ, TMDBID: id}
+	if profile != "" {
+		p.ProfileURL = imageURL(profile)
+	}
+	return p
+}
+func str(v any) string { s, _ := v.(string); return s }
+func num(v any) int    { f, _ := v.(float64); return int(f) }
 func yearFromDate(s string) int {
 	if len(s) < 4 {
 		return 0
