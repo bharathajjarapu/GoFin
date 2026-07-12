@@ -1,0 +1,8 @@
+.git
+.cache
+.commandcode
+gofin
+gofin.json
+gofin.db
+*.db
+specs

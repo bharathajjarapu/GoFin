@@ -1,0 +1,17 @@
+[Unit]
+Description=GoFin media server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=gofin
+Group=gofin
+EnvironmentFile=/srv/gofin/gofin.env
+WorkingDirectory=/srv/gofin
+ExecStart=/usr/local/bin/gofin serve --config /srv/gofin/gofin.json
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

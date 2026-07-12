@@ -1,0 +1,19 @@
+[Unit]
+Description=GoFin container
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=localhost/gofin:local
+ContainerName=gofin
+PublishPort=8096:8096
+Volume=/srv/gofin:/config
+# Change /srv/media to your mounted disk path, for example /mnt/media or /media/storage.
+Volume=/srv/media:/media:ro
+EnvironmentFile=/srv/gofin/gofin.env
+
+[Service]
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
