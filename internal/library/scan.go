@@ -27,6 +27,9 @@ var imageExt = map[string]string{"jpg": "image/jpeg", "jpeg": "image/jpeg", "png
 var epRe = regexp.MustCompile(`(?i)s(\d{1,2})e(\d{1,3})`)
 var providerRe = regexp.MustCompile(`(?i)\[(tmdbid|imdbid|tvdbid)-([^\]]+)\]`)
 
+// metadataNoMatch records that a metadata lookup was attempted without a match.
+const metadataNoMatch = "{}"
+
 func (s Scanner) Scan(libs []config.Library, only string) error {
 	if s.series == nil {
 		s.series = map[string]metadata.Result{}
@@ -76,42 +79,53 @@ func (s Scanner) scanLibrary(lib store.Library) error {
 		if s.Store.Unchanged(id, info.Size(), mtime) {
 			if lib.Type == "tvshows" {
 				_ = s.touchEpisodeParents(lib, rel)
+				// Files may have been first scanned before TMDB_API_KEY was set.
+				// Retry TV items that still have no provider metadata.
+				if s.needsMetadata(id) {
+					return s.upsertEpisode(lib, path, rel, ext, info.Size(), mtime)
+				}
+			} else if s.needsMetadata(id) {
+				return s.upsertMovie(lib, path, rel, ext, info.Size(), mtime)
 			}
 			return s.Store.TouchItem(id, s.scanID)
 		}
 		if lib.Type == "tvshows" {
 			return s.upsertEpisode(lib, path, rel, ext, info.Size(), mtime)
 		}
-		raw := cleanName(path)
-		ids := providerIDs(raw)
-		name, year := metadata.CleanYear(cleanProviders(raw))
-		it := store.Item{ID: id, LibraryID: lib.ID, ParentID: lib.ID, Type: "Movie", Name: name, Path: path, RelativePath: rel, Container: ext, Size: info.Size(), MTimeUnix: mtime, ProductionYear: year, LastSeenScan: s.scanID}
-		var md metadata.Result
-		hasMeta := false
-		if md, hasMeta = s.movieMeta(name, year, ids); hasMeta {
-			applyMeta(&it, md)
-		}
-		if err := s.Store.UpsertItem(it); err != nil {
-			return err
-		}
-		if hasMeta {
-			if err := s.savePeople(it.ID, md); err != nil {
-				return err
-			}
-			s.saveRemoteImages(it.ID, md)
-		}
-		return s.saveSidecars(it.ID, path)
+		return s.upsertMovie(lib, path, rel, ext, info.Size(), mtime)
 	}); err != nil {
 		return err
 	}
 	return s.Store.CleanupLibrary(lib.ID, s.scanID)
 }
 
+func (s Scanner) upsertMovie(lib store.Library, path, rel, ext string, size, mtime int64) error {
+	raw := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	ids := providerIDs(raw)
+	name, year := metadata.CleanYear(cleanPart(cleanProviders(raw)))
+	it := store.Item{ID: store.StableID("item", path), LibraryID: lib.ID, ParentID: lib.ID, Type: "Movie", Name: name, Path: path, RelativePath: rel, Container: ext, Size: size, MTimeUnix: mtime, ProductionYear: year, LastSeenScan: s.scanID}
+	md, hasMeta := s.movieMeta(name, year, ids)
+	if hasMeta {
+		applyMeta(&it, md)
+	} else {
+		s.markMetadataMiss(&it)
+	}
+	if err := s.Store.UpsertItem(it); err != nil {
+		return err
+	}
+	if hasMeta {
+		if err := s.savePeople(it.ID, md); err != nil {
+			return err
+		}
+		s.saveRemoteImages(it.ID, md)
+	}
+	return s.saveSidecars(it.ID, path)
+}
+
 func (s Scanner) upsertEpisode(lib store.Library, path, rel, ext string, size, mtime int64) error {
 	parts := strings.Split(filepath.ToSlash(rel), "/")
-	rawSeriesName := cleanPart(parts[0])
-	ids := providerIDs(rawSeriesName)
-	seriesName, year := metadata.CleanYear(cleanProviders(rawSeriesName))
+	rawSeriesName, ids := episodeSeriesSource(parts, path)
+	seriesName, year := metadata.CleanYear(cleanPart(cleanProviders(rawSeriesName)))
 	seriesID := store.StableID("series", lib.ID, seriesName)
 	season := 1
 	episode := 0
@@ -125,6 +139,8 @@ func (s Scanner) upsertEpisode(lib store.Library, path, rel, ext string, size, m
 	md, hasMeta := s.seriesMeta(seriesName, year, ids)
 	if hasMeta {
 		applyMeta(&series, md)
+	} else {
+		s.markMetadataMiss(&series)
 	}
 	if err := s.Store.UpsertItem(series); err != nil {
 		return err
@@ -168,6 +184,9 @@ func (s Scanner) upsertEpisode(lib store.Library, path, rel, ext string, size, m
 			it.ParentIndexNumber = season
 		}
 	}
+	if it.ProviderIDsJSON == "" {
+		s.markMetadataMiss(&it)
+	}
 	if err := s.Store.UpsertItem(it); err != nil {
 		return err
 	}
@@ -184,7 +203,11 @@ func (s Scanner) upsertEpisode(lib store.Library, path, rel, ext string, size, m
 
 func (s Scanner) touchEpisodeParents(lib store.Library, rel string) error {
 	parts := strings.Split(filepath.ToSlash(rel), "/")
-	seriesName, _ := metadata.CleanYear(cleanProviders(cleanPart(parts[0])))
+	rawSeriesName := parts[0]
+	if len(parts) == 1 {
+		rawSeriesName = seriesNameFromEpisodeFile(filepath.Base(rel))
+	}
+	seriesName, _ := metadata.CleanYear(cleanPart(cleanProviders(rawSeriesName)))
 	seriesID := store.StableID("series", lib.ID, seriesName)
 	season := 1
 	if m := epRe.FindStringSubmatch(filepath.Base(rel)); len(m) == 3 {
@@ -204,6 +227,24 @@ func (s Scanner) movieMeta(name string, year int, ids map[string]string) (metada
 		return s.Meta.MovieByIMDB(id)
 	}
 	return s.Meta.Movie(name, year)
+}
+
+func (s Scanner) needsMetadata(id string) bool {
+	if !s.Meta.Enabled || s.Meta.Key == "" {
+		return false
+	}
+	it, err := s.Store.Item(id)
+	return err != nil || it.ProviderIDsJSON == ""
+}
+
+func (s Scanner) markMetadataMiss(it *store.Item) {
+	if !s.Meta.Enabled || s.Meta.Key == "" || it.ProviderIDsJSON != "" {
+		return
+	}
+	if current, err := s.Store.Item(it.ID); err == nil && current.ProviderIDsJSON != "" {
+		return
+	}
+	it.ProviderIDsJSON = metadataNoMatch
 }
 
 func (s Scanner) seriesMeta(name string, year int, ids map[string]string) (metadata.Result, bool) {
@@ -304,6 +345,24 @@ func (s Scanner) saveFolderSidecars(id, dir string) error {
 func cleanName(path string) string {
 	return cleanPart(strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)))
 }
+
+func seriesNameFromEpisodeFile(name string) string {
+	if loc := epRe.FindStringIndex(name); loc != nil {
+		name = name[:loc[0]]
+	}
+	return strings.TrimSpace(name)
+}
+
+func episodeSeriesSource(parts []string, path string) (string, map[string]string) {
+	if len(parts) == 1 {
+		// Also accept a flat library such as "TV/Show Name S01E01.mkv".
+		// The recommended layout remains one show directory per series.
+		name := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+		return seriesNameFromEpisodeFile(name), providerIDs(name)
+	}
+	return parts[0], providerIDs(parts[0])
+}
+
 func cleanPart(s string) string {
 	s = strings.NewReplacer(".", " ", "_", " ", "-", " ").Replace(s)
 	return strings.Join(strings.Fields(s), " ")

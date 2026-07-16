@@ -1,5 +1,6 @@
 specs/
 .cache/
+dist/
 gofin
 gofin.json
 gofin.db

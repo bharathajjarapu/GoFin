@@ -150,9 +150,60 @@ func (a API) itemDTOs(items []store.Item, userID string) []map[string]any {
 	ids := itemIDs(items)
 	imgs, _ := a.S.ImagesByItemIDs(ids)
 	playback, _ := a.S.PlaybackByItemIDs(userID, ids)
+	parents := a.episodeParents(items)
 	out := make([]map[string]any, 0, len(items))
 	for _, it := range items {
-		out = append(out, a.itemDTOWith(it, imgs[it.ID], playback[it.ID]))
+		out = append(out, a.itemDTOWith(it, imgs[it.ID], playback[it.ID], parents[it.ID]))
+	}
+	return out
+}
+
+type episodeParent struct {
+	season store.Item
+	series store.Item
+	images []store.Image
+}
+
+func (a API) episodeParents(items []store.Item) map[string]*episodeParent {
+	seasonIDs := make([]string, 0)
+	seenSeasons := map[string]bool{}
+	for _, item := range items {
+		if item.Type == "Episode" && item.ParentID != "" && !seenSeasons[item.ParentID] {
+			seenSeasons[item.ParentID] = true
+			seasonIDs = append(seasonIDs, item.ParentID)
+		}
+	}
+	seasons, err := a.S.ItemsByIDs(seasonIDs)
+	if err != nil {
+		return map[string]*episodeParent{}
+	}
+	seriesIDs := make([]string, 0)
+	seenSeries := map[string]bool{}
+	for _, season := range seasons {
+		if season.ParentID != "" && !seenSeries[season.ParentID] {
+			seenSeries[season.ParentID] = true
+			seriesIDs = append(seriesIDs, season.ParentID)
+		}
+	}
+	series, err := a.S.ItemsByIDs(seriesIDs)
+	if err != nil {
+		return map[string]*episodeParent{}
+	}
+	images, err := a.S.ImagesByItemIDs(seriesIDs)
+	if err != nil {
+		return map[string]*episodeParent{}
+	}
+	out := map[string]*episodeParent{}
+	for _, item := range items {
+		season, ok := seasons[item.ParentID]
+		if !ok {
+			continue
+		}
+		series, ok := series[season.ParentID]
+		if !ok || series.Type != "Series" {
+			continue
+		}
+		out[item.ID] = &episodeParent{season: season, series: series, images: images[series.ID]}
 	}
 	return out
 }
@@ -280,23 +331,48 @@ func (a API) images(w http.ResponseWriter, r *http.Request, id string, parts []s
 func (a API) latest(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	u, _ := a.userNoFail(r)
-	items, err := a.S.Items(store.ItemQuery{ParentID: q.Get("ParentId"), Type: q.Get("IncludeItemTypes"), SortBy: "DateCreated", SortOrder: "Descending", Recursive: true, Limit: firstInt(q.Get("Limit"), 16)})
+	parentID := q.Get("ParentId")
+	query := store.ItemQuery{ParentID: parentID, Type: q.Get("IncludeItemTypes"), SortBy: "DateCreated", SortOrder: "Descending", Recursive: true, Limit: firstInt(q.Get("Limit"), 16)}
+	if a.isTVLibrary(parentID) {
+		// A TV library's home row should show recently added shows, not one
+		// card per episode. Opening a series exposes its seasons and episodes.
+		query.Type = "Series"
+		query.Recursive = false
+	}
+	items, err := a.S.Items(query)
 	if err != nil {
 		fail(w, err, 500)
 		return
 	}
 	var latest []store.Item
 	for _, it := range a.allowedItems(u, items) {
-		if it.Type != "CollectionFolder" && !it.IsFolder {
+		if it.Type != "CollectionFolder" && (!it.IsFolder || it.Type == "Series") {
 			latest = append(latest, it)
 		}
 	}
 	write(w, a.itemDTOs(latest, u.ID))
 }
 
+func (a API) isTVLibrary(id string) bool {
+	if id == "" {
+		return false
+	}
+	libraries, err := a.S.Libraries()
+	if err != nil {
+		return false
+	}
+	for _, library := range libraries {
+		if library.ID == id {
+			return library.Type == "tvshows"
+		}
+	}
+	return false
+}
+
 func (a API) resume(w http.ResponseWriter, r *http.Request) {
 	u, _ := a.userNoFail(r)
-	items, err := a.S.Resume(u.ID, firstInt(r.URL.Query().Get("Limit"), 16))
+	q := r.URL.Query()
+	items, err := a.S.Resume(u.ID, q.Get("ParentId"), q.Get("IncludeItemTypes"), firstInt(q.Get("Limit"), 16))
 	if err != nil {
 		fail(w, err, 500)
 		return
@@ -313,13 +389,18 @@ func (a API) shows(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	q := store.ItemQuery{ParentID: parts[0], Start: atoi(urlq.Get("StartIndex")), Limit: atoi(urlq.Get("Limit"))}
+	q := store.ItemQuery{ParentID: parts[0], Start: atoi(urlq.Get("StartIndex")), Limit: atoi(urlq.Get("Limit")), SortBy: "IndexNumber"}
 	if parts[1] == "Seasons" {
 		q.Type = "Season"
 	}
 	if parts[1] == "Episodes" && urlq.Get("SeasonId") != "" {
 		q.ParentID = urlq.Get("SeasonId")
 		q.Type = "Episode"
+	}
+	if parts[1] == "Episodes" && urlq.Get("SeasonId") == "" {
+		q.Type = "Season"
+		q.Start = 0
+		q.Limit = 0
 	}
 	items, err := a.S.Items(q)
 	if err != nil {
@@ -329,7 +410,7 @@ func (a API) shows(w http.ResponseWriter, r *http.Request) {
 	if parts[1] == "Episodes" && urlq.Get("SeasonId") == "" {
 		var eps []store.Item
 		for _, season := range items {
-			children, err := a.S.Items(store.ItemQuery{ParentID: season.ID, Type: "Episode"})
+			children, err := a.S.Items(store.ItemQuery{ParentID: season.ID, Type: "Episode", SortBy: "IndexNumber"})
 			if err != nil {
 				fail(w, err, 500)
 				return
@@ -337,8 +418,22 @@ func (a API) shows(w http.ResponseWriter, r *http.Request) {
 			eps = append(eps, children...)
 		}
 		items = eps
+		items = pagedItems(items, atoi(urlq.Get("StartIndex")), atoi(urlq.Get("Limit")))
 	}
 	write(w, page(a.itemDTOs(a.allowedItems(u, items), u.ID)))
+}
+
+func pagedItems(items []store.Item, start, limit int) []store.Item {
+	if start >= len(items) {
+		return nil
+	}
+	if start > 0 {
+		items = items[start:]
+	}
+	if limit > 0 && len(items) > limit {
+		return items[:limit]
+	}
+	return items
 }
 
 func (a API) nextUp(w http.ResponseWriter, r *http.Request) {
@@ -692,10 +787,10 @@ func (a API) itemDTO(it store.Item, userID string) map[string]any {
 	if userID != "" {
 		p = a.S.Playback(userID, it.ID)
 	}
-	return a.itemDTOWith(it, imgs, p)
+	return a.itemDTOWith(it, imgs, p, nil)
 }
 
-func (a API) itemDTOWith(it store.Item, imgs []store.Image, p store.Playback) map[string]any {
+func (a API) itemDTOWith(it store.Item, imgs []store.Image, p store.Playback, parent *episodeParent) map[string]any {
 	imageTags := map[string]string{}
 	backdrops := []string{}
 	for _, img := range imgs {
@@ -712,6 +807,13 @@ func (a API) itemDTOWith(it store.Item, imgs []store.Image, p store.Playback) ma
 	genres := stringsJSON(it.GenresJSON)
 	ud := userData(p, it.ID)
 	m := map[string]any{"Id": it.ID, "Name": it.Name, "ServerId": a.C.Server.ID, "Type": it.Type, "IsFolder": it.IsFolder, "ParentId": it.ParentID, "SortName": it.SortName, "DateCreated": it.DateCreated, "MediaType": mediaType, "ImageTags": imageTags, "BackdropImageTags": backdrops, "Overview": it.Overview, "ProductionYear": zeroNil(it.ProductionYear), "PremiereDate": emptyNil(it.PremiereDate), "IndexNumber": zeroNil(it.IndexNumber), "ParentIndexNumber": zeroNil(it.ParentIndexNumber), "ProviderIds": providerIDs(it.ProviderIDsJSON), "Genres": genres, "GenreItems": namedItems(genres), "Studios": namedItems(stringsJSON(it.StudiosJSON)), "People": people(it.PeopleJSON), "CommunityRating": zeroNilFloat(it.CommunityRating), "OfficialRating": emptyNil(it.OfficialRating), "RunTimeTicks": zeroNil64(it.RuntimeTicks), "Taglines": stringsJSON(it.TaglinesJSON), "ExternalUrls": externalURLs(it.ExternalURLsJSON), "MediaSourceCount": mediaSourceCount(it), "CanDownload": !it.IsFolder, "Container": emptyNil(it.Container), "Path": emptyNil(it.Path), "PrimaryImageAspectRatio": 0.6666666666666666, "UserData": ud}
+	if it.Type == "Episode" {
+		if parent != nil {
+			addEpisodeParentImageFields(m, parent.season, parent.series, parent.images)
+		} else {
+			a.addEpisodeParentImages(m, it)
+		}
+	}
 	if it.Type == "CollectionFolder" {
 		m["CollectionType"] = "movies"
 	}
@@ -720,6 +822,41 @@ func (a API) itemDTOWith(it store.Item, imgs []store.Image, p store.Playback) ma
 		m["MediaStreams"] = []any{}
 	}
 	return m
+}
+
+func (a API) addEpisodeParentImages(dto map[string]any, episode store.Item) {
+	season, err := a.S.Item(episode.ParentID)
+	if err != nil {
+		return
+	}
+	series, err := a.S.Item(season.ParentID)
+	if err != nil || series.Type != "Series" {
+		return
+	}
+	imgs, err := a.S.Images(series.ID)
+	if err != nil {
+		return
+	}
+	addEpisodeParentImageFields(dto, season, series, imgs)
+}
+
+func addEpisodeParentImageFields(dto map[string]any, season, series store.Item, imgs []store.Image) {
+	dto["SeriesId"] = series.ID
+	dto["SeriesName"] = series.Name
+	dto["SeasonId"] = season.ID
+	var backdrops []string
+	for _, img := range imgs {
+		switch img.Type {
+		case "Primary":
+			dto["SeriesPrimaryImageTag"] = img.Tag
+		case "Backdrop":
+			backdrops = append(backdrops, img.Tag)
+		}
+	}
+	if len(backdrops) > 0 {
+		dto["ParentBackdropItemId"] = series.ID
+		dto["ParentBackdropImageTags"] = backdrops
+	}
 }
 
 func (a API) mediaSource(it store.Item) map[string]any {

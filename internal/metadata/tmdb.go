@@ -1,7 +1,10 @@
 package metadata
 
 import (
+	"context"
 	"encoding/json"
+	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -13,10 +16,11 @@ import (
 )
 
 type Client struct {
-	Enabled bool
-	Key     string
-	Lang    string
-	HTTP    *http.Client
+	Enabled  bool
+	Key      string
+	Lang     string
+	HTTP     *http.Client
+	IPv4HTTP *http.Client
 }
 
 type Person struct {
@@ -42,7 +46,7 @@ type Result struct {
 }
 
 func New(c config.Metadata) Client {
-	return Client{Enabled: c.Enabled, Key: os.Getenv(c.APIKeyEnv), Lang: c.Language, HTTP: &http.Client{Timeout: 8 * time.Second}}
+	return Client{Enabled: c.Enabled, Key: os.Getenv(c.APIKeyEnv), Lang: c.Language, HTTP: &http.Client{Timeout: 8 * time.Second}, IPv4HTTP: &http.Client{Timeout: 8 * time.Second, Transport: ipv4Transport()}}
 }
 
 func (c Client) Movie(name string, year int) (Result, bool) {
@@ -152,12 +156,14 @@ func (c Client) search(kind, name string, year int) (Result, bool) {
 		}
 	}
 	u := "https://api.themoviedb.org/3/search/" + kind + "?" + v.Encode()
-	res, err := c.HTTP.Get(u)
+	res, err := c.getURL(u)
 	if err != nil {
+		log.Printf("TMDB search request failed: %v", err)
 		return Result{}, false
 	}
 	defer res.Body.Close()
 	if res.StatusCode/100 != 2 {
+		log.Printf("TMDB search returned HTTP %d", res.StatusCode)
 		return Result{}, false
 	}
 	var body struct {
@@ -303,12 +309,42 @@ func (c Client) getValues(path string, values url.Values, v any) bool {
 	}
 	values.Set("api_key", c.Key)
 	values.Set("language", c.Lang)
-	res, err := c.HTTP.Get("https://api.themoviedb.org/3/" + path + "?" + values.Encode())
+	res, err := c.getURL("https://api.themoviedb.org/3/" + path + "?" + values.Encode())
 	if err != nil {
+		log.Printf("TMDB %s request failed: %v", path, err)
 		return false
 	}
 	defer res.Body.Close()
-	return res.StatusCode/100 == 2 && json.NewDecoder(res.Body).Decode(v) == nil
+	if res.StatusCode/100 != 2 {
+		log.Printf("TMDB %s returned HTTP %d", path, res.StatusCode)
+		return false
+	}
+	if err := json.NewDecoder(res.Body).Decode(v); err != nil {
+		log.Printf("TMDB %s response decode failed: %v", path, err)
+		return false
+	}
+	return true
+}
+
+func (c Client) getURL(u string) (*http.Response, error) {
+	client := c.HTTP
+	if client == nil {
+		client = http.DefaultClient
+	}
+	res, err := client.Get(u)
+	if err != nil && c.IPv4HTTP != nil {
+		return c.IPv4HTTP.Get(u)
+	}
+	return res, err
+}
+
+func ipv4Transport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	dialer := &net.Dialer{Timeout: 8 * time.Second}
+	t.DialContext = func(ctx context.Context, _, address string) (net.Conn, error) {
+		return dialer.DialContext(ctx, "tcp4", address)
+	}
+	return t
 }
 
 func ProviderIDs(tmdb int, imdb string) string {

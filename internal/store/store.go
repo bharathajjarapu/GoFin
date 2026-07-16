@@ -408,6 +408,27 @@ func (s *Store) ImagesByItemIDs(ids []string) (map[string][]Image, error) {
 	return out, nil
 }
 
+func (s *Store) ItemsByIDs(ids []string) (map[string]Item, error) {
+	out := map[string]Item{}
+	for _, ids := range chunks(ids, 900) {
+		rows, err := s.DB.Query(selectItem+` WHERE i.id IN (`+marksN(len(ids))+`)`, anys(ids)...)
+		if err != nil {
+			return nil, err
+		}
+		items, err := scanItems(rows)
+		if closeErr := rows.Close(); err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range items {
+			out[item.ID] = item
+		}
+	}
+	return out, nil
+}
+
 func (s *Store) Items(q ItemQuery) ([]Item, error) {
 	sqlq := selectItem + ` WHERE 1=1`
 	var args []any
@@ -661,9 +682,20 @@ func (s *Store) SetRating(userID, itemID string, likes *bool) error {
 	return err
 }
 
-func (s *Store) Resume(userID string, limit int) ([]Item, error) {
-	q := selectItem + ` JOIN playback_state ps ON ps.item_id=i.id WHERE ps.user_id=? AND ps.playback_position_ticks>0 AND ps.played=0 ORDER BY ps.updated_at DESC`
+func (s *Store) Resume(userID, parentID, types string, limit int) ([]Item, error) {
+	q := selectItem + ` JOIN playback_state ps ON ps.item_id=i.id WHERE ps.user_id=? AND ps.playback_position_ticks>0 AND ps.played=0`
 	args := []any{userID}
+	if parentID != "" {
+		q += ` AND (i.library_id=? OR i.parent_id=?)`
+		args = append(args, parentID, parentID)
+	}
+	if types != "" {
+		q += ` AND i.type IN (` + marks(types) + `)`
+		for _, typ := range split(types) {
+			args = append(args, typ)
+		}
+	}
+	q += ` ORDER BY ps.updated_at DESC`
 	if limit > 0 {
 		q += ` LIMIT ?`
 		args = append(args, limit)
@@ -937,8 +969,12 @@ func orderBy(by, dir string) string {
 		return ` ORDER BY COALESCE(i.premiere_date,'')` + desc + `, i.sort_name`
 	case "CommunityRating":
 		return ` ORDER BY COALESCE(i.community_rating,0)` + desc + `, i.sort_name`
-	case "SortName", "ParentIndexNumber":
+	case "SortName":
 		return ` ORDER BY i.sort_name` + desc
+	case "IndexNumber":
+		return ` ORDER BY COALESCE(i.index_number,0)` + desc + `, i.sort_name`
+	case "ParentIndexNumber":
+		return ` ORDER BY COALESCE(i.parent_index_number,0)` + desc + `, COALESCE(i.index_number,0)` + desc + `, i.sort_name`
 	default:
 		return ` ORDER BY i.sort_name` + desc
 	}

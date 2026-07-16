@@ -155,6 +155,8 @@ func TestPhase5UserSessionAndNextUp(t *testing.T) {
 	must(t, s.UpsertItem(store.Item{ID: "season", LibraryID: "tv", ParentID: "show", Type: "Season", Name: "Season 1", IsFolder: true, IndexNumber: 1}))
 	must(t, s.UpsertItem(store.Item{ID: "e1", LibraryID: "tv", ParentID: "season", Type: "Episode", Name: "Episode 1", IndexNumber: 1, ParentIndexNumber: 1, RuntimeTicks: 100}))
 	must(t, s.UpsertItem(store.Item{ID: "e2", LibraryID: "tv", ParentID: "season", Type: "Episode", Name: "Episode 2", IndexNumber: 2, ParentIndexNumber: 1, RuntimeTicks: 100}))
+	must(t, s.UpsertImage(store.Image{ItemID: "show", Type: "Primary", Path: "poster.jpg", Tag: "series-poster"}))
+	must(t, s.UpsertImage(store.Image{ItemID: "show", Type: "Backdrop", Path: "backdrop.jpg", Tag: "series-backdrop"}))
 	h := API{C: config.Config{Server: config.Server{ID: "server-1"}}, S: s}.Handler()
 
 	status(t, h, http.MethodGet, "/Sessions", nil, nil, http.StatusUnauthorized)
@@ -178,6 +180,13 @@ func TestPhase5UserSessionAndNextUp(t *testing.T) {
 	if ud["Played"] != true || ud["PlayCount"].(float64) != 1 {
 		t.Fatalf("bad watched state: %#v", ud)
 	}
+	if item["SeriesId"] != "show" || item["SeriesPrimaryImageTag"] != "series-poster" || item["ParentBackdropItemId"] != "show" {
+		t.Fatalf("missing episode series images: %#v", item)
+	}
+	parentBackdrops := item["ParentBackdropImageTags"].([]any)
+	if len(parentBackdrops) != 1 || parentBackdrops[0] != "series-backdrop" {
+		t.Fatalf("bad episode parent backdrops: %#v", item)
+	}
 	next := get(t, h, "/Shows/NextUp?Limit=10", head, http.StatusOK)
 	if count(next) != 2 || firstID(next) != "a1" || next["Items"].([]any)[1].(map[string]any)["Id"] != "e2" {
 		t.Fatalf("bad next up: %#v", next)
@@ -188,6 +197,32 @@ func TestPhase5UserSessionAndNextUp(t *testing.T) {
 	}
 	post(t, h, "/Sessions/Logout", head, nil, http.StatusNoContent)
 	status(t, h, http.MethodGet, "/Sessions", head, nil, http.StatusUnauthorized)
+}
+
+func TestShowEpisodesAreOrderedByEpisodeNumber(t *testing.T) {
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "gofin.db"))
+	must(t, err)
+	defer s.Close()
+	must(t, s.SaveLibraries([]store.Library{{ID: "tv", Name: "TV", Type: "tvshows", Path: dir}}))
+	must(t, s.UpsertItem(store.Item{ID: "show", LibraryID: "tv", ParentID: "tv", Type: "Series", Name: "Show", IsFolder: true}))
+	must(t, s.UpsertItem(store.Item{ID: "season", LibraryID: "tv", ParentID: "show", Type: "Season", Name: "Season 1", IsFolder: true, IndexNumber: 1}))
+	must(t, s.UpsertItem(store.Item{ID: "e10", LibraryID: "tv", ParentID: "season", Type: "Episode", Name: "A title", IndexNumber: 10, ParentIndexNumber: 1}))
+	must(t, s.UpsertItem(store.Item{ID: "e2", LibraryID: "tv", ParentID: "season", Type: "Episode", Name: "Z title", IndexNumber: 2, ParentIndexNumber: 1}))
+	must(t, s.UpsertItem(store.Item{ID: "e1", LibraryID: "tv", ParentID: "season", Type: "Episode", Name: "Y title", IndexNumber: 1, ParentIndexNumber: 1}))
+	must(t, s.UpsertImage(store.Image{ItemID: "show", Type: "Primary", Path: "poster.jpg", Tag: "series-poster"}))
+	must(t, s.UpsertImage(store.Image{ItemID: "show", Type: "Backdrop", Path: "backdrop.jpg", Tag: "series-backdrop"}))
+	h := API{C: config.Config{Server: config.Server{ID: "server-1"}}, S: s}.Handler()
+	items := get(t, h, "/Shows/show/Episodes", nil, http.StatusOK)["Items"].([]any)
+	if len(items) != 3 || items[0].(map[string]any)["Id"] != "e1" || items[1].(map[string]any)["Id"] != "e2" || items[2].(map[string]any)["Id"] != "e10" {
+		t.Fatalf("episodes are not in numeric order: %#v", items)
+	}
+	for _, raw := range items {
+		item := raw.(map[string]any)
+		if item["SeriesId"] != "show" || item["SeriesPrimaryImageTag"] != "series-poster" || item["ParentBackdropItemId"] != "show" {
+			t.Fatalf("missing batched episode parent images: %#v", item)
+		}
+	}
 }
 
 func TestFavoritesAndChildPolicy(t *testing.T) {
@@ -371,11 +406,17 @@ func TestPlezyBaseFlow(t *testing.T) {
 	if count(episodes) != 1 {
 		t.Fatalf("episode count = %d", count(episodes))
 	}
+	episodeID := firstID(episodes)
 
 	post(t, h, "/Sessions/Playing/Progress", head, []byte(`{"ItemId":"`+movieID+`","PositionTicks":50000000}`), http.StatusNoContent)
-	resume := get(t, h, "/UserItems/Resume", head, http.StatusOK)
-	if count(resume) != 1 {
-		t.Fatalf("resume count = %d", count(resume))
+	post(t, h, "/Sessions/Playing/Progress", head, []byte(`{"ItemId":"`+episodeID+`","PositionTicks":50000000}`), http.StatusNoContent)
+	resumeMovies := get(t, h, "/UserItems/Resume?ParentId="+store.StableID("library", movies)+"&IncludeItemTypes=Movie", head, http.StatusOK)
+	if count(resumeMovies) != 1 || firstID(resumeMovies) != movieID {
+		t.Fatalf("movie resume row mixed library items: %#v", resumeMovies)
+	}
+	resumeTV := get(t, h, "/UserItems/Resume?ParentId="+store.StableID("library", tv)+"&IncludeItemTypes=Episode", head, http.StatusOK)
+	if count(resumeTV) != 1 || firstID(resumeTV) != episodeID {
+		t.Fatalf("TV resume row mixed library items: %#v", resumeTV)
 	}
 
 	movieLibID := store.StableID("library", movies)
@@ -385,8 +426,8 @@ func TestPlezyBaseFlow(t *testing.T) {
 		t.Fatalf("latest movies count = %d", count(latestMovies))
 	}
 	latestTVMovies := get(t, h, "/Items/Latest?ParentId="+tvLibID+"&IncludeItemTypes=Movie", head, http.StatusOK)
-	if count(latestTVMovies) != 0 {
-		t.Fatalf("latest tv movies count = %d", count(latestTVMovies))
+	if count(latestTVMovies) != 1 || firstID(latestTVMovies) != seriesID || latestTVMovies["Items"].([]any)[0].(map[string]any)["Type"] != "Series" {
+		t.Fatalf("latest TV should return its series: %#v", latestTVMovies)
 	}
 	get(t, h, "/Users/user/Items/Latest", head, http.StatusOK)
 	get(t, h, "/Items/Counts", head, http.StatusOK)
