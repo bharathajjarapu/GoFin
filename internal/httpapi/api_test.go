@@ -713,3 +713,64 @@ func TestPagingTotalsAndDownload(t *testing.T) {
 		t.Fatalf("download must be an attachment: %q", w.Header().Get("Content-Disposition"))
 	}
 }
+
+// The fields and filters a music client reads to render counts, art, durations
+// and artist pages.
+func TestMusicClientFields(t *testing.T) {
+	s, dir := musicStore(t)
+	defer s.Close()
+	cover := filepath.Join(dir, "cover.jpg")
+	must(t, os.WriteFile(cover, []byte("jpeg-bytes"), 0600))
+	must(t, s.UpsertImage(store.Image{ItemID: "album", Type: "Primary", Path: cover, Tag: "covertag", Mime: "image/jpeg"}))
+	h := API{C: config.Config{Server: config.Server{ID: "server-1"}}, S: s}.Handler()
+	head := login(t, h)
+
+	// Ping is public: a client calls it before it has a token.
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/System/Ping", nil))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "Jellyfin Server") {
+		t.Fatalf("ping = %d %q", w.Code, w.Body.String())
+	}
+
+	album := get(t, h, "/Items?IncludeItemTypes=MusicAlbum", head, http.StatusOK)["Items"].([]any)[0].(map[string]any)
+	if album["ChildCount"].(float64) != 1 || album["RecursiveItemCount"].(float64) != 1 {
+		t.Fatalf("album counts = %#v", album)
+	}
+	// An album's length is the sum of its tracks, not a stored column.
+	if album["RunTimeTicks"].(float64) != 10000000 {
+		t.Fatalf("album runtime = %v", album["RunTimeTicks"])
+	}
+	artist := get(t, h, "/Items?IncludeItemTypes=MusicArtist", head, http.StatusOK)["Items"].([]any)[0].(map[string]any)
+	if artist["ChildCount"].(float64) != 1 || artist["RecursiveItemCount"].(float64) != 1 {
+		t.Fatalf("artist counts = %#v", artist)
+	}
+
+	// Art lives on the album, so a track has to borrow the tag or clients draw
+	// a blank tile beside every song.
+	track := get(t, h, "/Items?IncludeItemTypes=Audio", head, http.StatusOK)["Items"].([]any)[0].(map[string]any)
+	if track["AlbumPrimaryImageTag"] != "covertag" {
+		t.Fatalf("track album art tag = %#v", track["AlbumPrimaryImageTag"])
+	}
+
+	byArtist := get(t, h, "/Items?IncludeItemTypes=Audio&ArtistIds=artist", head, http.StatusOK)
+	if count(byArtist) != 1 || firstID(byArtist) != "track" {
+		t.Fatalf("tracks by artist = %#v", byArtist)
+	}
+	byAlbumArtist := get(t, h, "/Items?IncludeItemTypes=MusicAlbum&AlbumArtistIds=artist", head, http.StatusOK)
+	if count(byAlbumArtist) != 1 || firstID(byAlbumArtist) != "album" {
+		t.Fatalf("albums by artist = %#v", byAlbumArtist)
+	}
+	byID := get(t, h, "/Items?Ids=album,track", head, http.StatusOK)
+	if count(byID) != 2 {
+		t.Fatalf("by ids = %#v", byID)
+	}
+	if shuffled := get(t, h, "/Items?IncludeItemTypes=Audio&SortBy=Random", head, http.StatusOK); count(shuffled) != 1 {
+		t.Fatalf("random sort dropped items: %#v", shuffled)
+	}
+
+	genre := get(t, h, "/MusicGenres/Post-Punk", head, http.StatusOK)
+	if genre["Name"] != "Post-Punk" || genre["Type"] != "MusicGenre" {
+		t.Fatalf("genre = %#v", genre)
+	}
+	status(t, h, http.MethodGet, "/MusicGenres/Nope", head, nil, http.StatusNotFound)
+}

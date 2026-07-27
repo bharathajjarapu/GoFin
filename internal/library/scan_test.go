@@ -350,3 +350,50 @@ func TestScanIgnoresForeignContainers(t *testing.T) {
 		}
 	}
 }
+
+// A leading article belongs at the end of an artist's sort key, and one tag
+// may credit several performers.
+func TestScanMusicSortNameAndMultipleArtists(t *testing.T) {
+	dir := t.TempDir()
+	music := filepath.Join(dir, "Music")
+	flacTrack(t, filepath.Join(music, "The Beatles", "Abbey Road", "01.flac"),
+		"TITLE=Come Together", "ALBUM=Abbey Road", "ALBUMARTIST=The Beatles",
+		"ARTIST=The Beatles; Billy Preston")
+	// A slash is part of the name, not a separator.
+	flacTrack(t, filepath.Join(music, "AC-DC", "Back in Black", "01.flac"),
+		"TITLE=Hells Bells", "ALBUM=Back in Black", "ALBUMARTIST=AC/DC", "ARTIST=AC/DC")
+
+	s, err := store.Open(filepath.Join(dir, "gofin.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	libs := []config.Library{{Name: "Music", Type: "music", Path: music}}
+	if err := (Scanner{Store: s}).ScanContext(context.Background(), libs, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	artists, err := s.Items(store.ItemQuery{Type: "MusicArtist", SortBy: "SortName"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(artists) != 2 {
+		t.Fatalf("artists = %d, want 2", len(artists))
+	}
+	// "AC/DC" must survive intact, and "The Beatles" must sort under B, which
+	// puts it after AC/DC rather than under T.
+	if artists[0].Name != "AC/DC" || artists[1].Name != "The Beatles" {
+		t.Fatalf("artist order = %q, %q", artists[0].Name, artists[1].Name)
+	}
+	if artists[1].SortName != "beatles" {
+		t.Fatalf("sort name = %q, want %q", artists[1].SortName, "beatles")
+	}
+
+	tracks, err := s.Items(store.ItemQuery{Type: "Audio", Search: "Come Together"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tracks) != 1 || tracks[0].ArtistsJSON != `["The Beatles","Billy Preston"]` {
+		t.Fatalf("artists json = %#v", tracks)
+	}
+}

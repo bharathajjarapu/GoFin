@@ -159,9 +159,7 @@ func applyMP4Tag(t *Tags, name string, v []byte) {
 	case "aART":
 		t.AlbumArtist = firstNonEmpty(t.AlbumArtist, string(v))
 	case "\xa9ART":
-		if s := string(v); s != "" {
-			t.Artists = append(t.Artists, s)
-		}
+		t.Artists = append(t.Artists, splitArtists(string(v))...)
 	case "\xa9gen":
 		t.Genre = firstNonEmpty(t.Genre, string(v))
 	case "\xa9day":

@@ -70,7 +70,7 @@ type PersonQuery struct {
 
 type ItemQuery struct {
 	ParentID, Type, Search, SortBy, SortOrder, PersonIDs, Genres, OfficialRatings, Years, NameStartsWith string
-	UserID, Name                                                                                         string
+	UserID, Name, IDs, ArtistIDs                                                                         string
 	Recursive                                                                                            bool
 	Favorite, Played, Unplayed                                                                           bool
 	Start, Limit                                                                                         int
@@ -481,6 +481,58 @@ func (s *Store) ItemsByIDs(ids []string) (map[string]Item, error) {
 	return out, nil
 }
 
+// FolderStat summarises what sits beneath a folder item.
+type FolderStat struct {
+	ChildCount, RecursiveItemCount int
+	RuntimeTicks                   int64
+}
+
+// maxFolderDepth bounds the descent below a folder. The tree only ever runs
+// library -> artist -> album -> track, so the cap costs nothing and stops a
+// cycle in parent_id from spinning the recursive query forever.
+const maxFolderDepth = 8
+
+// FolderStats reports, for each of ids in a single pass, how many direct
+// children it has, how many media files sit anywhere below it, and how long
+// they run. Those are the numbers behind "12 tracks", "62 episodes" and an
+// album's total duration. Asking per item would mean one query per row of
+// every listing.
+func (s *Store) FolderStats(ids []string) (map[string]FolderStat, error) {
+	out := map[string]FolderStat{}
+	for _, ids := range chunks(ids, 900) {
+		rows, err := s.DB.Query(`WITH RECURSIVE tree(root,id,depth) AS (
+				SELECT id,id,0 FROM items WHERE id IN (`+marksN(len(ids))+`)
+				UNION ALL
+				SELECT t.root,i.id,t.depth+1 FROM items i JOIN tree t ON i.parent_id=t.id WHERE t.depth<?
+			)
+			SELECT t.root,
+				SUM(CASE WHEN t.depth=1 THEN 1 ELSE 0 END),
+				SUM(CASE WHEN t.depth>0 AND i.is_folder=0 THEN 1 ELSE 0 END),
+				SUM(CASE WHEN t.depth>0 THEN COALESCE(i.runtime_ticks,0) ELSE 0 END)
+			FROM tree t JOIN items i ON i.id=t.id
+			GROUP BY t.root`, append(anys(ids), maxFolderDepth)...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id string
+			var stat FolderStat
+			if err := rows.Scan(&id, &stat.ChildCount, &stat.RecursiveItemCount, &stat.RuntimeTicks); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			out[id] = stat
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
 // itemFilter builds the WHERE fragment shared by Items and CountItems so that a
 // listing and its reported total can never drift apart. It returns a fragment
 // meant to follow "WHERE 1=1", which keeps every clause below uniform.
@@ -536,6 +588,24 @@ func itemFilter(q ItemQuery) (string, []any) {
 		sqlq += ` AND i.production_year IN (` + marks(q.Years) + `)`
 		for _, y := range split(q.Years) {
 			args = append(args, y)
+		}
+	}
+	if q.IDs != "" {
+		sqlq += ` AND i.id IN (` + marks(q.IDs) + `)`
+		for _, id := range split(q.IDs) {
+			args = append(args, id)
+		}
+	}
+	if q.ArtistIDs != "" {
+		// An album is a child of its artist and a track is a grandchild, so
+		// matching both parent levels answers "everything by this artist"
+		// without joining the tree twice.
+		placeholders := marks(q.ArtistIDs)
+		sqlq += ` AND (i.parent_id IN (` + placeholders + `) OR i.parent_id IN (SELECT id FROM items WHERE parent_id IN (` + placeholders + `)))`
+		for range 2 {
+			for _, id := range split(q.ArtistIDs) {
+				args = append(args, id)
+			}
 		}
 	}
 	if q.PersonIDs != "" {
@@ -1084,6 +1154,9 @@ func orderBy(by, dir string) string {
 		return ` ORDER BY COALESCE(i.index_number,0)` + desc + `, i.sort_name`
 	case "ParentIndexNumber":
 		return ` ORDER BY COALESCE(i.parent_index_number,0)` + desc + `, COALESCE(i.index_number,0)` + desc + `, i.sort_name`
+	case "Random":
+		// Shuffle-all. The direction a client sends is meaningless here.
+		return ` ORDER BY RANDOM()`
 	default:
 		return ` ORDER BY i.sort_name` + desc
 	}

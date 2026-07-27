@@ -87,6 +87,21 @@ func leadingInt(s string) int {
 	return n
 }
 
+// splitArtists breaks one artist tag into the performers it credits. Semicolon
+// is the conventional separator; a slash is deliberately not treated as one,
+// because it appears inside names such as AC/DC. A file that credits several
+// artists properly repeats the tag instead, which callers already accumulate.
+func splitArtists(value string) []string {
+	parts := strings.Split(value, ";")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
 // firstNonEmpty returns the first value that is not blank.
 func firstNonEmpty(values ...string) string {
 	for _, v := range values {

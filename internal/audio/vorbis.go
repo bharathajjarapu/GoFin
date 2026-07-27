@@ -57,7 +57,7 @@ func applyVorbisTag(t *Tags, entry string) {
 	case "ALBUMARTIST", "ALBUM ARTIST":
 		t.AlbumArtist = firstNonEmpty(t.AlbumArtist, value)
 	case "ARTIST":
-		t.Artists = append(t.Artists, value)
+		t.Artists = append(t.Artists, splitArtists(value)...)
 	case "GENRE":
 		t.Genre = firstNonEmpty(t.Genre, value)
 	case "TRACKNUMBER":

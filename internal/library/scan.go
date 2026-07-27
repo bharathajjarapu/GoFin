@@ -258,7 +258,7 @@ func (s Scanner) upsertTrack(lib store.Library, path, rel, ext string, size, mti
 
 	artistID := store.StableID("artist", lib.ID, strings.ToLower(artistName))
 	albumID := store.StableID("album", artistID, strings.ToLower(albumName))
-	artist := store.Item{ID: artistID, LibraryID: lib.ID, ParentID: lib.ID, Type: "MusicArtist", Name: artistName, IsFolder: true, LastSeenScan: s.scanID}
+	artist := store.Item{ID: artistID, LibraryID: lib.ID, ParentID: lib.ID, Type: "MusicArtist", Name: artistName, SortName: artistSortName(artistName), IsFolder: true, LastSeenScan: s.scanID}
 	if err := s.Store.UpsertItem(artist); err != nil {
 		return err
 	}
@@ -460,6 +460,17 @@ const (
 	unknownArtist = "Unknown Artist"
 	unknownAlbum  = "Unknown Album"
 )
+
+// artistSortName files an artist under its first significant word, so that
+// "The Beatles" sorts under B the way a record shelf does. Items store sort
+// names lowercased.
+func artistSortName(name string) string {
+	lower := strings.ToLower(name)
+	if rest, ok := strings.CutPrefix(lower, "the "); ok && rest != "" {
+		return rest
+	}
+	return lower
+}
 
 // folderAt returns the folder at depth i of a path relative to the library
 // root, or "" when the file sits above that depth.

@@ -81,6 +81,7 @@ func (a API) Handler() http.Handler {
 	m := http.NewServeMux()
 	m.HandleFunc("/System/Info/Public", a.systemInfoPublic)
 	m.HandleFunc("/System/Info", a.systemInfo)
+	m.HandleFunc("/System/Ping", a.ping)
 	m.HandleFunc("/QuickConnect/Enabled", a.quickConnect)
 	m.HandleFunc("/Branding/Configuration", a.branding)
 	m.HandleFunc("/Branding/Css", a.css)
@@ -113,6 +114,7 @@ func (a API) Handler() http.Handler {
 	m.HandleFunc("/Artists", a.artists)
 	m.HandleFunc("/Artists/", a.artists)
 	m.HandleFunc("/MusicGenres", a.musicGenres)
+	m.HandleFunc("/MusicGenres/", a.musicGenres)
 	m.HandleFunc("/Videos/", a.stream)
 	m.HandleFunc("/Audio/", a.stream)
 	m.HandleFunc("/Users/", a.usersCompat)
@@ -132,7 +134,7 @@ func requestHeaders(next http.Handler) http.Handler {
 // server discovery, the login user picker, and the login call itself.
 func publicPath(p string) bool {
 	switch p {
-	case "/System/Info/Public", "/Users/Public", "/Users/AuthenticateByName":
+	case "/System/Info/Public", "/System/Ping", "/Users/Public", "/Users/AuthenticateByName":
 		return true
 	}
 	return false
@@ -157,10 +159,15 @@ func (a API) requireAuth(next http.Handler) http.Handler {
 func (a API) systemInfo(w http.ResponseWriter, r *http.Request)       { write(w, a.info()) }
 func (a API) systemInfoPublic(w http.ResponseWriter, r *http.Request) { write(w, a.info()) }
 func (a API) quickConnect(w http.ResponseWriter, r *http.Request)     { write(w, false) }
-func (a API) branding(w http.ResponseWriter, r *http.Request)         { write(w, map[string]any{}) }
-func (a API) css(w http.ResponseWriter, r *http.Request)              { w.Header().Set("Content-Type", "text/css") }
-func (a API) displayPrefs(w http.ResponseWriter, r *http.Request)     { write(w, map[string]any{}) }
-func (a API) parentalRatings(w http.ResponseWriter, r *http.Request)  { write(w, parentalRatings()) }
+
+// ping answers the connection test a client runs before offering a login form.
+// Jellyfin replies with this exact string.
+func (a API) ping(w http.ResponseWriter, r *http.Request) { write(w, "Jellyfin Server") }
+
+func (a API) branding(w http.ResponseWriter, r *http.Request)        { write(w, map[string]any{}) }
+func (a API) css(w http.ResponseWriter, r *http.Request)             { w.Header().Set("Content-Type", "text/css") }
+func (a API) displayPrefs(w http.ResponseWriter, r *http.Request)    { write(w, map[string]any{}) }
+func (a API) parentalRatings(w http.ResponseWriter, r *http.Request) { write(w, parentalRatings()) }
 func (a API) info() map[string]any {
 	return map[string]any{"ServerName": a.C.Server.Name, "Id": a.C.Server.ID, "LocalAddress": a.C.Server.PublicURL, "Version": "10.10.0", "ProductName": "GoFin", "OperatingSystem": "Linux", "StartupWizardCompleted": true}
 }
@@ -229,7 +236,7 @@ func (a API) userViews(w http.ResponseWriter, r *http.Request) {
 func (a API) items(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	u, _ := a.userNoFail(r)
-	query := store.ItemQuery{ParentID: q.Get("ParentId"), Type: q.Get("IncludeItemTypes"), Search: q.Get("SearchTerm"), SortBy: q.Get("SortBy"), SortOrder: q.Get("SortOrder"), PersonIDs: q.Get("PersonIds"), Genres: q.Get("Genres"), OfficialRatings: q.Get("OfficialRatings"), Years: q.Get("Years"), NameStartsWith: q.Get("NameStartsWith"), UserID: u.ID, Favorite: userFilter(q, "IsFavorite"), Played: userFilter(q, "IsPlayed"), Unplayed: userFilter(q, "IsUnplayed"), Recursive: parseBool(q.Get("Recursive")), Start: atoi(q.Get("StartIndex")), Limit: queryLimit(q.Get("Limit"))}
+	query := store.ItemQuery{ParentID: q.Get("ParentId"), Type: q.Get("IncludeItemTypes"), Search: q.Get("SearchTerm"), SortBy: q.Get("SortBy"), SortOrder: q.Get("SortOrder"), PersonIDs: q.Get("PersonIds"), Genres: q.Get("Genres"), OfficialRatings: q.Get("OfficialRatings"), Years: q.Get("Years"), NameStartsWith: q.Get("NameStartsWith"), IDs: q.Get("Ids"), ArtistIDs: firstNonEmpty(q.Get("ArtistIds"), q.Get("AlbumArtistIds")), UserID: u.ID, Favorite: userFilter(q, "IsFavorite"), Played: userFilter(q, "IsPlayed"), Unplayed: userFilter(q, "IsUnplayed"), Recursive: parseBool(q.Get("Recursive")), Start: atoi(q.Get("StartIndex")), Limit: queryLimit(q.Get("Limit"))}
 	items, err := a.S.Items(query)
 	if err != nil {
 		fail(w, err, 500)
@@ -266,16 +273,68 @@ func (a API) allowedItems(u store.User, items []store.Item) []store.Item {
 	return out
 }
 
+// itemExtras carries the per-item lookups a DTO needs beyond the item row.
+// Each one is fetched once for a whole page rather than once per item.
+type itemExtras struct {
+	images   []store.Image
+	playback store.Playback
+	parent   *episodeParent
+	stat     store.FolderStat
+	albumTag string
+}
+
 func (a API) itemDTOs(items []store.Item, userID string) []map[string]any {
 	ids := itemIDs(items)
 	imgs, _ := a.S.ImagesByItemIDs(ids)
 	playback, _ := a.S.PlaybackByItemIDs(userID, ids)
 	parents := a.episodeParents(items)
+	stats, _ := a.S.FolderStats(folderIDs(items))
+	albumTags := a.albumImageTags(items)
 	out := make([]map[string]any, 0, len(items))
 	for _, it := range items {
-		out = append(out, a.itemDTOWith(it, imgs[it.ID], playback[it.ID], parents[it.ID]))
+		out = append(out, a.itemDTOWith(it, itemExtras{
+			images:   imgs[it.ID],
+			playback: playback[it.ID],
+			parent:   parents[it.ID],
+			stat:     stats[it.ID],
+			albumTag: albumTags[it.ParentID],
+		}))
 	}
 	return out
+}
+
+// folderIDs picks out the items that can have children, so the stats query
+// never descends from a leaf.
+func folderIDs(items []store.Item) []string {
+	var out []string
+	for _, it := range items {
+		if it.IsFolder {
+			out = append(out, it.ID)
+		}
+	}
+	return out
+}
+
+// albumImageTags maps album id to primary image tag for the tracks on a page.
+// Cover art is stored against the album, so without this a track carries no
+// image of its own and a client draws a blank tile beside every song.
+func (a API) albumImageTags(items []store.Item) map[string]string {
+	var albums []string
+	seen := map[string]bool{}
+	for _, it := range items {
+		if it.Type == "Audio" && it.ParentID != "" && !seen[it.ParentID] {
+			seen[it.ParentID] = true
+			albums = append(albums, it.ParentID)
+		}
+	}
+	if len(albums) == 0 {
+		return nil
+	}
+	imgs, err := a.S.ImagesByItemIDs(albums)
+	if err != nil {
+		return nil
+	}
+	return primaryImageTags(imgs)
 }
 
 type episodeParent struct {
@@ -894,20 +953,42 @@ func (a API) artists(w http.ResponseWriter, r *http.Request) {
 }
 
 // musicGenres lists the genres present on music items, which clients offer as
-// a browse axis alongside artists and albums.
+// a browse axis alongside artists and albums, and resolves one by name so that
+// tapping a genre opens it instead of 404ing.
 func (a API) musicGenres(w http.ResponseWriter, r *http.Request) {
 	u, _ := a.userNoFail(r)
+	name, err := url.PathUnescape(strings.Trim(strings.TrimPrefix(r.URL.Path, "/MusicGenres"), "/"))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
 	items, err := a.S.Items(store.ItemQuery{Type: "MusicAlbum,Audio"})
 	if err != nil {
 		fail(w, err, http.StatusInternalServerError)
 		return
 	}
 	genres := a.filterGenres(u, items)
+	if name != "" {
+		for _, g := range genres {
+			if strings.EqualFold(g, name) {
+				write(w, a.genreDTO(g, "MusicGenre"))
+				return
+			}
+		}
+		http.NotFound(w, r)
+		return
+	}
 	out := make([]map[string]any, 0, len(genres))
 	for _, g := range genres {
-		out = append(out, map[string]any{"Name": g, "Id": store.StableID("name", g), "Type": "MusicGenre", "ServerId": a.C.Server.ID})
+		out = append(out, a.genreDTO(g, "MusicGenre"))
 	}
 	write(w, page(out, len(out)))
+}
+
+// genreDTO renders a genre as the folder-shaped item a client browses into.
+func (a API) genreDTO(name, typ string) map[string]any {
+	return map[string]any{"Name": name, "Id": store.StableID("name", name), "Type": typ,
+		"ServerId": a.C.Server.ID, "IsFolder": true, "ImageTags": map[string]string{}}
 }
 
 func (a API) persons(w http.ResponseWriter, r *http.Request) {
@@ -1033,19 +1114,16 @@ func (a API) usersCompat(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
 }
 
+// itemDTO renders a single item through the same path as a listing, so the two
+// can never report different fields for the same row.
 func (a API) itemDTO(it store.Item, userID string) map[string]any {
-	imgs, _ := a.S.Images(it.ID)
-	p := store.Playback{}
-	if userID != "" {
-		p = a.S.Playback(userID, it.ID)
-	}
-	return a.itemDTOWith(it, imgs, p, nil)
+	return a.itemDTOs([]store.Item{it}, userID)[0]
 }
 
-func (a API) itemDTOWith(it store.Item, imgs []store.Image, p store.Playback, parent *episodeParent) map[string]any {
+func (a API) itemDTOWith(it store.Item, x itemExtras) map[string]any {
 	imageTags := map[string]string{}
 	backdrops := []string{}
-	for _, img := range imgs {
+	for _, img := range x.images {
 		if img.Type == "Backdrop" {
 			backdrops = append(backdrops, img.Tag)
 		} else {
@@ -1053,17 +1131,30 @@ func (a API) itemDTOWith(it store.Item, imgs []store.Image, p store.Playback, pa
 		}
 	}
 	genres := stringsJSON(it.GenresJSON)
-	ud := userData(p, it.ID)
+	ud := userData(x.playback, it.ID)
 	m := map[string]any{"Id": it.ID, "Name": it.Name, "ServerId": a.C.Server.ID, "Type": it.Type, "IsFolder": it.IsFolder, "ParentId": it.ParentID, "SortName": it.SortName, "DateCreated": it.DateCreated, "MediaType": mediaType(it), "ImageTags": imageTags, "BackdropImageTags": backdrops, "Overview": it.Overview, "ProductionYear": zeroNil(it.ProductionYear), "PremiereDate": emptyNil(it.PremiereDate), "IndexNumber": zeroNil(it.IndexNumber), "ParentIndexNumber": zeroNil(it.ParentIndexNumber), "ProviderIds": providerIDs(it.ProviderIDsJSON), "Genres": genres, "GenreItems": namedItems(genres), "Studios": namedItems(stringsJSON(it.StudiosJSON)), "People": people(it.PeopleJSON), "CommunityRating": zeroNilFloat(it.CommunityRating), "OfficialRating": emptyNil(it.OfficialRating), "RunTimeTicks": zeroNil64(it.RuntimeTicks), "Taglines": stringsJSON(it.TaglinesJSON), "ExternalUrls": externalURLs(it.ExternalURLsJSON), "MediaSourceCount": mediaSourceCount(it), "CanDownload": !it.IsFolder, "Container": emptyNil(it.Container), "Path": emptyNil(it.Path), "PrimaryImageAspectRatio": primaryAspectRatio(it), "UserData": ud}
 	if it.Type == "Episode" {
-		if parent != nil {
-			addEpisodeParentImageFields(m, parent.season, parent.series, parent.images)
+		if x.parent != nil {
+			addEpisodeParentImageFields(m, x.parent.season, x.parent.series, x.parent.images)
 		} else {
 			a.addEpisodeParentImages(m, it)
 		}
 	}
 	if it.Type == "CollectionFolder" {
 		m["CollectionType"] = jfType(a.libraryType(it.ID))
+	}
+	if it.IsFolder {
+		// What a card shows under its title: "12 tracks", "62 episodes".
+		m["ChildCount"] = x.stat.ChildCount
+		m["RecursiveItemCount"] = x.stat.RecursiveItemCount
+	}
+	if it.Type == "MusicAlbum" && x.stat.RuntimeTicks > 0 {
+		// An album's length is the sum of its tracks. It cannot be stored at
+		// scan time because the album row is written before its tracks exist.
+		m["RunTimeTicks"] = x.stat.RuntimeTicks
+	}
+	if it.Type == "Audio" && x.albumTag != "" {
+		m["AlbumPrimaryImageTag"] = x.albumTag
 	}
 	if isMusic(it) {
 		addMusicFields(m, it)
@@ -1124,6 +1215,16 @@ func addMusicFields(dto map[string]any, it store.Item) {
 	if it.Type == "Audio" {
 		dto["AlbumId"] = it.ParentID
 	}
+}
+
+// firstNonEmpty returns the first value that is not blank.
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // nonEmpty returns s as a single-element list, or an empty list when s is blank.
