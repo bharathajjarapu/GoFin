@@ -1,9 +1,12 @@
 package httpapi
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
+	"log"
+	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -11,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"gofin/internal/config"
@@ -19,11 +23,61 @@ import (
 )
 
 type API struct {
-	C config.Config
-	S *store.Store
+	C       config.Config
+	S       *store.Store
+	Meta    metadata.Client
+	limiter *loginLimiter
+}
+
+type authUserKey struct{}
+
+type loginAttempt struct {
+	started time.Time
+	count   int
+}
+
+type loginLimiter struct {
+	mu       sync.Mutex
+	attempts map[string]loginAttempt
+}
+
+func newLoginLimiter() *loginLimiter {
+	return &loginLimiter{attempts: map[string]loginAttempt{}}
+}
+
+func (l *loginLimiter) allow(remoteAddr string, now time.Time) (bool, time.Duration) {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.attempts) >= 1024 {
+		for key, attempt := range l.attempts {
+			if now.Sub(attempt.started) >= time.Minute {
+				delete(l.attempts, key)
+			}
+		}
+		if len(l.attempts) >= 1024 {
+			return false, time.Minute
+		}
+	}
+	attempt := l.attempts[host]
+	if attempt.started.IsZero() || now.Sub(attempt.started) >= time.Minute {
+		attempt = loginAttempt{started: now}
+	}
+	if attempt.count >= 10 {
+		return false, time.Minute - now.Sub(attempt.started)
+	}
+	attempt.count++
+	l.attempts[host] = attempt
+	return true, 0
 }
 
 func (a API) Handler() http.Handler {
+	if a.limiter == nil {
+		a.limiter = newLoginLimiter()
+	}
 	m := http.NewServeMux()
 	m.HandleFunc("/System/Info/Public", a.systemInfoPublic)
 	m.HandleFunc("/System/Info", a.systemInfo)
@@ -56,9 +110,48 @@ func (a API) Handler() http.Handler {
 	m.HandleFunc("/Sessions/", a.sessions)
 	m.HandleFunc("/Persons", a.personsList)
 	m.HandleFunc("/Persons/", a.persons)
-	m.HandleFunc("/Videos/", a.video)
+	m.HandleFunc("/Artists", a.artists)
+	m.HandleFunc("/Artists/", a.artists)
+	m.HandleFunc("/MusicGenres", a.musicGenres)
+	m.HandleFunc("/Videos/", a.stream)
+	m.HandleFunc("/Audio/", a.stream)
 	m.HandleFunc("/Users/", a.usersCompat)
-	return log(m)
+	return requestHeaders(requestLog(a.requireAuth(m)))
+}
+
+func requestHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// publicPath lists the endpoints a client reaches before it holds a token:
+// server discovery, the login user picker, and the login call itself.
+func publicPath(p string) bool {
+	switch p {
+	case "/System/Info/Public", "/Users/Public", "/Users/AuthenticateByName":
+		return true
+	}
+	return false
+}
+
+// requireAuth keeps the login handshake public and requires a token everywhere
+// else, including direct-stream URLs where the token is supplied as api_key.
+func (a API) requireAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !publicPath(r.URL.Path) {
+			u, ok := a.userNoFail(r)
+			if !ok {
+				fail(w, nil, http.StatusUnauthorized)
+				return
+			}
+			r = r.WithContext(context.WithValue(r.Context(), authUserKey{}, u))
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (a API) systemInfo(w http.ResponseWriter, r *http.Request)       { write(w, a.info()) }
@@ -86,8 +179,17 @@ func (a API) usersPublic(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a API) auth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if ok, retry := a.limiter.allow(r.RemoteAddr, time.Now()); !ok {
+		w.Header().Set("Retry-After", strconv.Itoa(max(1, int(math.Ceil(retry.Seconds())))))
+		fail(w, nil, http.StatusTooManyRequests)
+		return
+	}
 	var in struct{ Username, Pw, Password string }
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+	if err := decodeJSON(w, r, &in); err != nil {
 		fail(w, err, 400)
 		return
 	}
@@ -127,7 +229,7 @@ func (a API) userViews(w http.ResponseWriter, r *http.Request) {
 func (a API) items(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	u, _ := a.userNoFail(r)
-	items, err := a.S.Items(store.ItemQuery{ParentID: q.Get("ParentId"), Type: q.Get("IncludeItemTypes"), Search: q.Get("SearchTerm"), SortBy: q.Get("SortBy"), SortOrder: q.Get("SortOrder"), PersonIDs: q.Get("PersonIds"), Genres: q.Get("Genres"), OfficialRatings: q.Get("OfficialRatings"), Years: q.Get("Years"), NameStartsWith: q.Get("NameStartsWith"), UserID: u.ID, Favorite: userFilter(q, "IsFavorite"), Played: userFilter(q, "IsPlayed"), Unplayed: userFilter(q, "IsUnplayed"), Recursive: parseBool(q.Get("Recursive")), Start: atoi(q.Get("StartIndex")), Limit: atoi(q.Get("Limit"))})
+	items, err := a.S.Items(store.ItemQuery{ParentID: q.Get("ParentId"), Type: q.Get("IncludeItemTypes"), Search: q.Get("SearchTerm"), SortBy: q.Get("SortBy"), SortOrder: q.Get("SortOrder"), PersonIDs: q.Get("PersonIds"), Genres: q.Get("Genres"), OfficialRatings: q.Get("OfficialRatings"), Years: q.Get("Years"), NameStartsWith: q.Get("NameStartsWith"), UserID: u.ID, Favorite: userFilter(q, "IsFavorite"), Played: userFilter(q, "IsPlayed"), Unplayed: userFilter(q, "IsUnplayed"), Recursive: parseBool(q.Get("Recursive")), Start: atoi(q.Get("StartIndex")), Limit: queryLimit(q.Get("Limit"))})
 	if err != nil {
 		fail(w, err, 500)
 		return
@@ -278,7 +380,7 @@ func (a API) playbackInfo(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	u, _ := a.userNoFail(r)
 	if !a.allowed(u, it) {
-		fail(w, errors.New("forbidden"), http.StatusForbidden)
+		fail(w, nil, http.StatusForbidden)
 		return
 	}
 	dto := a.itemDTO(it, u.ID)
@@ -287,7 +389,12 @@ func (a API) playbackInfo(w http.ResponseWriter, r *http.Request, id string) {
 
 func (a API) images(w http.ResponseWriter, r *http.Request, id string, parts []string) {
 	u, _ := a.userNoFail(r)
-	if it, err := a.S.Item(id); err == nil && !a.allowed(u, it) {
+	if it, err := a.S.Item(id); err == nil {
+		if !a.allowed(u, it) {
+			http.NotFound(w, r)
+			return
+		}
+	} else if person, err := a.S.PersonByID(id); err == nil && !a.personAllowed(u, person.ID) {
 		http.NotFound(w, r)
 		return
 	}
@@ -311,8 +418,16 @@ func (a API) images(w http.ResponseWriter, r *http.Request, id string, parts []s
 	}
 	for _, img := range imgs {
 		if strings.EqualFold(img.Type, typ) && img.Index == idx {
-			if strings.HasPrefix(img.Path, "http://") || strings.HasPrefix(img.Path, "https://") {
+			if remoteImageURL(img.Path) {
 				http.Redirect(w, r, img.Path, http.StatusFound)
+				return
+			}
+			if img.Path == "" {
+				http.NotFound(w, r)
+				return
+			}
+			if info, err := os.Stat(img.Path); err != nil || info.IsDir() {
+				http.NotFound(w, r)
 				return
 			}
 			http.ServeFile(w, r, img.Path)
@@ -320,7 +435,7 @@ func (a API) images(w http.ResponseWriter, r *http.Request, id string, parts []s
 		}
 	}
 	if strings.EqualFold(typ, "Primary") {
-		if img, _ := a.S.PersonImageByID(id); img != "" {
+		if img, _ := a.S.PersonImageByID(id); remoteImageURL(img) {
 			http.Redirect(w, r, img, http.StatusFound)
 			return
 		}
@@ -333,11 +448,15 @@ func (a API) latest(w http.ResponseWriter, r *http.Request) {
 	u, _ := a.userNoFail(r)
 	parentID := q.Get("ParentId")
 	query := store.ItemQuery{ParentID: parentID, Type: q.Get("IncludeItemTypes"), SortBy: "DateCreated", SortOrder: "Descending", Recursive: true, Limit: firstInt(q.Get("Limit"), 16)}
-	if a.isTVLibrary(parentID) {
+	switch a.libraryType(parentID) {
+	case "tvshows":
 		// A TV library's home row should show recently added shows, not one
 		// card per episode. Opening a series exposes its seasons and episodes.
-		query.Type = "Series"
-		query.Recursive = false
+		query.Type, query.Recursive = "Series", false
+	case "music":
+		// Likewise a music library lists newly added albums, not loose tracks.
+		// Albums hang off their artist, so this stays a recursive lookup.
+		query.Type, query.Recursive = "MusicAlbum", true
 	}
 	items, err := a.S.Items(query)
 	if err != nil {
@@ -346,27 +465,42 @@ func (a API) latest(w http.ResponseWriter, r *http.Request) {
 	}
 	var latest []store.Item
 	for _, it := range a.allowedItems(u, items) {
-		if it.Type != "CollectionFolder" && (!it.IsFolder || it.Type == "Series") {
+		if latestRow(it) {
 			latest = append(latest, it)
 		}
 	}
 	write(w, a.itemDTOs(latest, u.ID))
 }
 
-func (a API) isTVLibrary(id string) bool {
-	if id == "" {
+// latestRow reports whether an item belongs on a "recently added" row: leaf
+// media, plus the folder kinds a client shows as a single card.
+func latestRow(it store.Item) bool {
+	switch it.Type {
+	case "CollectionFolder":
 		return false
+	case "Series", "MusicAlbum":
+		return true
+	}
+	return !it.IsFolder
+}
+
+// libraryType reports the configured type of a library item, or "" when the id
+// does not name a library. The libraries table holds a handful of rows, so the
+// scan is cheaper than carrying the type on every item.
+func (a API) libraryType(id string) string {
+	if id == "" {
+		return ""
 	}
 	libraries, err := a.S.Libraries()
 	if err != nil {
-		return false
+		return ""
 	}
 	for _, library := range libraries {
 		if library.ID == id {
-			return library.Type == "tvshows"
+			return library.Type
 		}
 	}
-	return false
+	return ""
 }
 
 func (a API) resume(w http.ResponseWriter, r *http.Request) {
@@ -389,7 +523,17 @@ func (a API) shows(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	q := store.ItemQuery{ParentID: parts[0], Start: atoi(urlq.Get("StartIndex")), Limit: atoi(urlq.Get("Limit")), SortBy: "IndexNumber"}
+	if parts[1] == "Episodes" && urlq.Get("SeasonId") == "" {
+		items, err := a.S.EpisodesForSeries(parts[0])
+		if err != nil {
+			fail(w, err, http.StatusInternalServerError)
+			return
+		}
+		items = pagedItems(items, atoi(urlq.Get("StartIndex")), queryLimit(urlq.Get("Limit")))
+		write(w, page(a.itemDTOs(a.allowedItems(u, items), u.ID)))
+		return
+	}
+	q := store.ItemQuery{ParentID: parts[0], Start: atoi(urlq.Get("StartIndex")), Limit: queryLimit(urlq.Get("Limit")), SortBy: "IndexNumber"}
 	if parts[1] == "Seasons" {
 		q.Type = "Season"
 	}
@@ -397,28 +541,10 @@ func (a API) shows(w http.ResponseWriter, r *http.Request) {
 		q.ParentID = urlq.Get("SeasonId")
 		q.Type = "Episode"
 	}
-	if parts[1] == "Episodes" && urlq.Get("SeasonId") == "" {
-		q.Type = "Season"
-		q.Start = 0
-		q.Limit = 0
-	}
 	items, err := a.S.Items(q)
 	if err != nil {
 		fail(w, err, 500)
 		return
-	}
-	if parts[1] == "Episodes" && urlq.Get("SeasonId") == "" {
-		var eps []store.Item
-		for _, season := range items {
-			children, err := a.S.Items(store.ItemQuery{ParentID: season.ID, Type: "Episode", SortBy: "IndexNumber"})
-			if err != nil {
-				fail(w, err, 500)
-				return
-			}
-			eps = append(eps, children...)
-		}
-		items = eps
-		items = pagedItems(items, atoi(urlq.Get("StartIndex")), atoi(urlq.Get("Limit")))
 	}
 	write(w, page(a.itemDTOs(a.allowedItems(u, items), u.ID)))
 }
@@ -448,17 +574,19 @@ func (a API) nextUp(w http.ResponseWriter, r *http.Request) {
 }
 func (a API) counts(w http.ResponseWriter, r *http.Request) {
 	u, _ := a.userNoFail(r)
-	if u.ID == "" || u.IsAdmin || !u.IsChild || u.MaxParentalRating == 0 {
-		movies, _ := a.S.CountItemsByType("Movie")
-		series, _ := a.S.CountItemsByType("Series")
-		episodes, _ := a.S.CountItemsByType("Episode")
-		write(w, map[string]int{"MovieCount": movies, "SeriesCount": series, "EpisodeCount": episodes})
-		return
+	counts := map[string]string{"MovieCount": "Movie", "SeriesCount": "Series", "EpisodeCount": "Episode",
+		"SongCount": "Audio", "AlbumCount": "MusicAlbum", "ArtistCount": "MusicArtist"}
+	out := map[string]int{}
+	unrestricted := u.ID == "" || u.IsAdmin || !u.IsChild || u.MaxParentalRating == 0
+	for field, typ := range counts {
+		if unrestricted {
+			out[field], _ = a.S.CountItemsByType(typ)
+			continue
+		}
+		items, _ := a.S.Items(store.ItemQuery{Type: typ})
+		out[field] = a.allowedCount(u, items)
 	}
-	movies, _ := a.S.Items(store.ItemQuery{Type: "Movie"})
-	series, _ := a.S.Items(store.ItemQuery{Type: "Series"})
-	episodes, _ := a.S.Items(store.ItemQuery{Type: "Episode"})
-	write(w, map[string]int{"MovieCount": a.allowedCount(u, movies), "SeriesCount": a.allowedCount(u, series), "EpisodeCount": a.allowedCount(u, episodes)})
+	write(w, out)
 }
 func (a API) filters(w http.ResponseWriter, r *http.Request) {
 	u, _ := a.userNoFail(r)
@@ -528,7 +656,7 @@ func (a API) setFavorite(w http.ResponseWriter, r *http.Request, u store.User, i
 		return
 	}
 	if !a.allowed(u, it) {
-		fail(w, errors.New("forbidden"), http.StatusForbidden)
+		fail(w, nil, http.StatusForbidden)
 		return
 	}
 	switch r.Method {
@@ -558,7 +686,7 @@ func (a API) rating(w http.ResponseWriter, r *http.Request) {
 		fail(w, err, http.StatusNotFound)
 		return
 	} else if !a.allowed(u, it) {
-		fail(w, errors.New("forbidden"), http.StatusForbidden)
+		fail(w, nil, http.StatusForbidden)
 		return
 	}
 	var likes *bool
@@ -588,14 +716,20 @@ func (a API) playedItems(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !a.allowed(u, it) {
-		fail(w, errors.New("forbidden"), http.StatusForbidden)
+		fail(w, nil, http.StatusForbidden)
 		return
 	}
 	switch r.Method {
 	case http.MethodPost:
-		_ = a.S.SaveProgress(u.ID, id, 0, true)
+		if err := a.S.SaveProgress(u.ID, id, 0, true); err != nil {
+			fail(w, err, http.StatusInternalServerError)
+			return
+		}
 	case http.MethodDelete:
-		_ = a.S.SaveProgress(u.ID, id, 0, false)
+		if err := a.S.SaveProgress(u.ID, id, 0, false); err != nil {
+			fail(w, err, http.StatusInternalServerError)
+			return
+		}
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -625,49 +759,129 @@ func (a API) sessions(w http.ResponseWriter, r *http.Request) {
 		if _, ok := a.user(w, r); !ok {
 			return
 		}
-		_ = a.S.DeleteToken(token(r))
+		if err := a.S.DeleteToken(token(r)); err != nil {
+			fail(w, err, http.StatusInternalServerError)
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	if strings.Contains(r.URL.Path, "/Playing") {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		var in struct {
 			ItemId        string
 			PositionTicks int64
 		}
-		_ = json.NewDecoder(r.Body).Decode(&in)
+		if err := decodeJSON(w, r, &in); err != nil {
+			return
+		}
 		if u, ok := a.userNoFail(r); ok && in.ItemId != "" {
+			it, err := a.S.Item(in.ItemId)
+			if err != nil || !a.allowed(u, it) {
+				fail(w, nil, http.StatusForbidden)
+				return
+			}
 			played := false
 			if strings.HasSuffix(r.URL.Path, "/Stopped") {
-				if it, err := a.S.Item(in.ItemId); err == nil && it.RuntimeTicks > 0 {
+				if it.RuntimeTicks > 0 {
 					played = in.PositionTicks >= it.RuntimeTicks*9/10
 				} else {
 					played = in.PositionTicks == 0
 				}
 			}
-			_ = a.S.SaveProgress(u.ID, in.ItemId, in.PositionTicks, played)
+			if err := a.S.SaveProgress(u.ID, in.ItemId, in.PositionTicks, played); err != nil {
+				fail(w, err, http.StatusInternalServerError)
+				return
+			}
 		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (a API) video(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/Videos/")
-	if i := strings.Index(id, "/"); i >= 0 {
-		id = id[:i]
-	}
-	if i := strings.Index(id, "."); i >= 0 {
-		id = id[:i]
-	}
+// stream serves the original file for both /Videos/{id}/... and
+// /Audio/{id}/..., including Jellyfin's /universal audio route. GoFin never
+// transcodes, so every one of them returns the same bytes and http.ServeFile
+// answers the range requests that clients seek with.
+func (a API) stream(w http.ResponseWriter, r *http.Request) {
+	_, rest, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, "/"), "/")
+	id, _, _ := strings.Cut(rest, "/")
+	id, _, _ = strings.Cut(id, ".")
 	it, err := a.S.Item(id)
 	if err != nil {
 		fail(w, err, 404)
 		return
 	}
-	if u, ok := a.userNoFail(r); ok && !a.allowed(u, it) {
-		fail(w, errors.New("forbidden"), http.StatusForbidden)
+	if u, ok := a.userNoFail(r); !ok || !a.allowed(u, it) {
+		fail(w, nil, http.StatusForbidden)
 		return
 	}
+	if it.IsFolder || it.Path == "" {
+		http.NotFound(w, r)
+		return
+	}
+	if info, err := os.Stat(it.Path); err != nil || info.IsDir() {
+		http.NotFound(w, r)
+		return
+	}
+	// Go's mime table does not cover every media container, and a client that
+	// receives audio labelled as a generic byte stream may refuse to play it.
+	if ct := contentTypes[it.Container]; ct != "" {
+		w.Header().Set("Content-Type", ct)
+	}
 	http.ServeFile(w, r, it.Path)
+}
+
+// artists lists music artists, or returns one by name for /Artists/{name}.
+// Jellyfin splits performers from album artists; GoFin indexes a single
+// artist per album, so both routes answer from the same set.
+func (a API) artists(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	u, _ := a.userNoFail(r)
+	name, err := url.PathUnescape(strings.Trim(strings.TrimPrefix(r.URL.Path, "/Artists"), "/"))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	query := store.ItemQuery{Type: "MusicArtist", Search: q.Get("SearchTerm"), NameStartsWith: q.Get("NameStartsWith"),
+		Start: atoi(q.Get("StartIndex")), Limit: queryLimit(q.Get("Limit"))}
+	if name != "" && name != "AlbumArtists" {
+		query = store.ItemQuery{Type: "MusicArtist", Name: name}
+	}
+	items, err := a.S.Items(query)
+	if err != nil {
+		fail(w, err, http.StatusInternalServerError)
+		return
+	}
+	items = a.allowedItems(u, items)
+	if name != "" && name != "AlbumArtists" {
+		if len(items) == 0 {
+			http.NotFound(w, r)
+			return
+		}
+		write(w, a.itemDTO(items[0], u.ID))
+		return
+	}
+	write(w, page(a.itemDTOs(items, u.ID)))
+}
+
+// musicGenres lists the genres present on music items, which clients offer as
+// a browse axis alongside artists and albums.
+func (a API) musicGenres(w http.ResponseWriter, r *http.Request) {
+	u, _ := a.userNoFail(r)
+	items, err := a.S.Items(store.ItemQuery{Type: "MusicAlbum,Audio"})
+	if err != nil {
+		fail(w, err, http.StatusInternalServerError)
+		return
+	}
+	genres := a.filterGenres(u, items)
+	out := make([]map[string]any, 0, len(genres))
+	for _, g := range genres {
+		out = append(out, map[string]any{"Name": g, "Id": store.StableID("name", g), "Type": "MusicGenre", "ServerId": a.C.Server.ID})
+	}
+	write(w, page(out))
 }
 
 func (a API) persons(w http.ResponseWriter, r *http.Request) {
@@ -701,7 +915,12 @@ func (a API) persons(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if img, _ := a.S.PersonImage(u); img != "" {
+	person, err := a.person(u)
+	if err != nil || !a.personAllowed(mustUser(r), person.ID) {
+		http.NotFound(w, r)
+		return
+	}
+	if img := person.ProfileURL; remoteImageURL(img) {
 		http.Redirect(w, r, img, http.StatusFound)
 		return
 	}
@@ -710,7 +929,7 @@ func (a API) persons(w http.ResponseWriter, r *http.Request) {
 
 func (a API) personsList(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	people, err := a.S.People(store.PersonQuery{Search: q.Get("SearchTerm"), StartsWith: q.Get("NameStartsWith"), AppearsInItemID: q.Get("AppearsInItemId"), Types: q.Get("PersonTypes"), ExcludeTypes: q.Get("ExcludePersonTypes"), Start: atoi(q.Get("StartIndex")), Limit: atoi(q.Get("Limit"))})
+	people, err := a.S.People(store.PersonQuery{Search: q.Get("SearchTerm"), StartsWith: q.Get("NameStartsWith"), AppearsInItemID: q.Get("AppearsInItemId"), Types: q.Get("PersonTypes"), ExcludeTypes: q.Get("ExcludePersonTypes"), Start: atoi(q.Get("StartIndex")), Limit: queryLimit(q.Get("Limit"))})
 	if err != nil {
 		fail(w, err, 500)
 		return
@@ -734,7 +953,7 @@ func (a API) person(name string) (store.Person, error) {
 	if p.TMDBID == 0 || !stale(p.UpdatedAt, 30*24*time.Hour) {
 		return p, nil
 	}
-	if d, ok := metadata.New(a.C.Metadata).PersonDetails(p.TMDBID); ok {
+	if d, ok := a.metadataClient().PersonDetails(p.TMDBID); ok {
 		p.IMDBID, p.Biography, p.BirthDate, p.DeathDate = d.IMDBID, d.Biography, d.BirthDate, d.DeathDate
 		p.PlaceOfBirth, p.KnownDepartment = d.PlaceOfBirth, d.KnownDepartment
 		if d.ProfileURL != "" {
@@ -743,6 +962,13 @@ func (a API) person(name string) (store.Person, error) {
 		_ = a.S.UpdatePersonDetails(p)
 	}
 	return p, nil
+}
+
+func (a API) metadataClient() metadata.Client {
+	if a.Meta.HTTP != nil {
+		return a.Meta
+	}
+	return metadata.New(a.C.Metadata)
 }
 
 func (a API) usersCompat(w http.ResponseWriter, r *http.Request) {
@@ -800,13 +1026,9 @@ func (a API) itemDTOWith(it store.Item, imgs []store.Image, p store.Playback, pa
 			imageTags[img.Type] = img.Tag
 		}
 	}
-	mediaType := "Video"
-	if it.IsFolder {
-		mediaType = "Unknown"
-	}
 	genres := stringsJSON(it.GenresJSON)
 	ud := userData(p, it.ID)
-	m := map[string]any{"Id": it.ID, "Name": it.Name, "ServerId": a.C.Server.ID, "Type": it.Type, "IsFolder": it.IsFolder, "ParentId": it.ParentID, "SortName": it.SortName, "DateCreated": it.DateCreated, "MediaType": mediaType, "ImageTags": imageTags, "BackdropImageTags": backdrops, "Overview": it.Overview, "ProductionYear": zeroNil(it.ProductionYear), "PremiereDate": emptyNil(it.PremiereDate), "IndexNumber": zeroNil(it.IndexNumber), "ParentIndexNumber": zeroNil(it.ParentIndexNumber), "ProviderIds": providerIDs(it.ProviderIDsJSON), "Genres": genres, "GenreItems": namedItems(genres), "Studios": namedItems(stringsJSON(it.StudiosJSON)), "People": people(it.PeopleJSON), "CommunityRating": zeroNilFloat(it.CommunityRating), "OfficialRating": emptyNil(it.OfficialRating), "RunTimeTicks": zeroNil64(it.RuntimeTicks), "Taglines": stringsJSON(it.TaglinesJSON), "ExternalUrls": externalURLs(it.ExternalURLsJSON), "MediaSourceCount": mediaSourceCount(it), "CanDownload": !it.IsFolder, "Container": emptyNil(it.Container), "Path": emptyNil(it.Path), "PrimaryImageAspectRatio": 0.6666666666666666, "UserData": ud}
+	m := map[string]any{"Id": it.ID, "Name": it.Name, "ServerId": a.C.Server.ID, "Type": it.Type, "IsFolder": it.IsFolder, "ParentId": it.ParentID, "SortName": it.SortName, "DateCreated": it.DateCreated, "MediaType": mediaType(it), "ImageTags": imageTags, "BackdropImageTags": backdrops, "Overview": it.Overview, "ProductionYear": zeroNil(it.ProductionYear), "PremiereDate": emptyNil(it.PremiereDate), "IndexNumber": zeroNil(it.IndexNumber), "ParentIndexNumber": zeroNil(it.ParentIndexNumber), "ProviderIds": providerIDs(it.ProviderIDsJSON), "Genres": genres, "GenreItems": namedItems(genres), "Studios": namedItems(stringsJSON(it.StudiosJSON)), "People": people(it.PeopleJSON), "CommunityRating": zeroNilFloat(it.CommunityRating), "OfficialRating": emptyNil(it.OfficialRating), "RunTimeTicks": zeroNil64(it.RuntimeTicks), "Taglines": stringsJSON(it.TaglinesJSON), "ExternalUrls": externalURLs(it.ExternalURLsJSON), "MediaSourceCount": mediaSourceCount(it), "CanDownload": !it.IsFolder, "Container": emptyNil(it.Container), "Path": emptyNil(it.Path), "PrimaryImageAspectRatio": 0.6666666666666666, "UserData": ud}
 	if it.Type == "Episode" {
 		if parent != nil {
 			addEpisodeParentImageFields(m, parent.season, parent.series, parent.images)
@@ -815,13 +1037,58 @@ func (a API) itemDTOWith(it store.Item, imgs []store.Image, p store.Playback, pa
 		}
 	}
 	if it.Type == "CollectionFolder" {
-		m["CollectionType"] = "movies"
+		m["CollectionType"] = jfType(a.libraryType(it.ID))
+	}
+	if isMusic(it) {
+		addMusicFields(m, it)
 	}
 	if !it.IsFolder {
 		m["MediaSources"] = []map[string]any{a.mediaSource(it)}
 		m["MediaStreams"] = []any{}
 	}
 	return m
+}
+
+// mediaType tells a client how to play an item, which decides whether it opens
+// the audio or the video player.
+func mediaType(it store.Item) string {
+	switch {
+	case it.IsFolder:
+		return "Unknown"
+	case it.Type == "Audio":
+		return "Audio"
+	}
+	return "Video"
+}
+
+func isMusic(it store.Item) bool {
+	return it.Type == "Audio" || it.Type == "MusicAlbum" || it.Type == "MusicArtist"
+}
+
+// addMusicFields fills the album and artist fields Jellyfin music clients read.
+// They carry both plain names and name/id pairs because clients use the names
+// for display and the ids to navigate.
+func addMusicFields(dto map[string]any, it store.Item) {
+	artists := stringsJSON(it.ArtistsJSON)
+	dto["Artists"] = artists
+	dto["ArtistItems"] = namedItems(artists)
+	dto["AlbumArtist"] = emptyNil(it.AlbumArtist)
+	dto["AlbumArtists"] = namedItems(nonEmpty(it.AlbumArtist))
+	if it.Type == "MusicArtist" {
+		return
+	}
+	dto["Album"] = emptyNil(it.Album)
+	if it.Type == "Audio" {
+		dto["AlbumId"] = it.ParentID
+	}
+}
+
+// nonEmpty returns s as a single-element list, or an empty list when s is blank.
+func nonEmpty(s string) []string {
+	if s == "" {
+		return nil
+	}
+	return []string{s}
 }
 
 func (a API) addEpisodeParentImages(dto map[string]any, episode store.Item) {
@@ -862,7 +1129,11 @@ func addEpisodeParentImageFields(dto map[string]any, season, series store.Item, 
 func (a API) mediaSource(it store.Item) map[string]any {
 	sourceID := store.StableID("source", it.ID)
 	playID := store.StableID("play", it.ID)
-	url := "/Videos/" + it.ID + "/stream?Static=true&MediaSourceId=" + sourceID + "&PlaySessionId=" + playID + "&Container=" + it.Container
+	route := "/Videos/"
+	if it.Type == "Audio" {
+		route = "/Audio/"
+	}
+	url := route + it.ID + "/stream?Static=true&MediaSourceId=" + sourceID + "&PlaySessionId=" + playID + "&Container=" + it.Container
 	return map[string]any{"Id": sourceID, "MediaSourceId": sourceID, "Path": it.Path, "Protocol": "File", "Type": "Default", "Container": it.Container, "Size": it.Size, "Name": filepath.Base(it.Path), "RunTimeTicks": zeroNil64(it.RuntimeTicks), "IsRemote": false, "SupportsDirectPlay": true, "SupportsDirectStream": true, "SupportsTranscoding": false, "MediaStreams": []any{}, "DirectStreamUrl": url}
 }
 
@@ -874,11 +1145,14 @@ func (a API) user(w http.ResponseWriter, r *http.Request) (store.User, bool) {
 	return u, ok
 }
 func (a API) userNoFail(r *http.Request) (store.User, bool) {
+	if u, ok := r.Context().Value(authUserKey{}).(store.User); ok {
+		return u, true
+	}
 	t := token(r)
 	if t == "" {
 		return store.User{}, false
 	}
-	u, err := a.S.UserByToken(t)
+	u, err := a.S.UserByTokenContext(r.Context(), t)
 	return u, err == nil
 }
 
@@ -918,34 +1192,67 @@ func userDTO(u store.User, serverID string) map[string]any {
 func sessionDTO(s store.Session) map[string]any {
 	return map[string]any{"Id": s.ID, "UserId": s.UserID, "UserName": s.UserName, "DeviceId": s.DeviceID, "DeviceName": s.DeviceName, "Client": s.Client, "ApplicationVersion": "", "IsActive": true, "SupportsMediaControl": false}
 }
+
+// jfType maps a configured library type to the Jellyfin collection name.
 func jfType(t string) string {
-	if t == "tvshows" {
-		return "tvshows"
+	switch t {
+	case "tvshows", "music":
+		return t
 	}
 	return "movies"
 }
+
+// contentTypes pins the media types Go's mime table does not reliably resolve.
+// A client that receives audio labelled as a generic byte stream may refuse to
+// play it, so the container decides the header rather than the file extension.
+var contentTypes = map[string]string{
+	"flac": "audio/flac", "m4a": "audio/mp4", "m4b": "audio/mp4",
+	"ogg": "audio/ogg", "oga": "audio/ogg", "opus": "audio/ogg",
+	"mkv": "video/x-matroska", "webm": "video/webm", "mp4": "video/mp4",
+	"m4v": "video/mp4", "avi": "video/x-msvideo", "mov": "video/quicktime",
+}
+
 func write(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
 }
 func fail(w http.ResponseWriter, err error, code int) {
-	if err == nil {
-		err = errors.New(http.StatusText(code))
+	if err != nil && code >= http.StatusInternalServerError {
+		log.Printf("request failed: %v", err)
 	}
-	http.Error(w, err.Error(), code)
+	http.Error(w, http.StatusText(code), code)
 }
-func log(next http.Handler) http.Handler {
+func requestLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = os.Stdout.WriteString(r.Method + " " + r.URL.Path + "\n")
+		log.Printf("%s %q", r.Method, r.URL.EscapedPath())
 		next.ServeHTTP(w, r)
 	})
 }
-func atoi(s string) int { n, _ := strconv.Atoi(s); return n }
+func atoi(s string) int {
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 || n > 1000000 {
+		return 0
+	}
+	return n
+}
 func firstInt(s string, d int) int {
 	if n := atoi(s); n > 0 {
-		return n
+		return min(n, 500)
 	}
 	return d
+}
+func queryLimit(s string) int { return min(atoi(s), 500) }
+func decodeJSON(w http.ResponseWriter, r *http.Request, v any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	return json.NewDecoder(r.Body).Decode(v)
+}
+func remoteImageURL(s string) bool {
+	u, err := url.Parse(s)
+	return err == nil && u.Scheme == "https" && u.Host == "image.tmdb.org"
+}
+func mustUser(r *http.Request) store.User {
+	u, _ := r.Context().Value(authUserKey{}).(store.User)
+	return u
 }
 func parseBool(s string) bool { return strings.EqualFold(s, "true") }
 func (a API) allowed(u store.User, it store.Item) bool {
@@ -1097,7 +1404,7 @@ func namedItems(names []string) []map[string]string {
 	return out
 }
 func itemHint(it store.Item, primaryTag string) map[string]any {
-	m := map[string]any{"ItemId": it.ID, "Id": it.ID, "Name": it.Name, "MatchedTerm": it.Name, "Type": it.Type, "MediaType": "Video", "ProductionYear": zeroNil(it.ProductionYear)}
+	m := map[string]any{"ItemId": it.ID, "Id": it.ID, "Name": it.Name, "MatchedTerm": it.Name, "Type": it.Type, "MediaType": mediaType(it), "ProductionYear": zeroNil(it.ProductionYear)}
 	if it.IsFolder {
 		m["MediaType"] = "Unknown"
 	}

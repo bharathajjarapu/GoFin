@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"gofin/internal/config"
 	"gofin/internal/library"
@@ -22,9 +24,11 @@ func TestRichMovieDTO(t *testing.T) {
 	defer s.Close()
 	c := config.Config{Server: config.Server{Name: "GoFin Test", ID: "server-1"}, Libraries: []config.Library{{Name: "Movies", Type: "movies", Path: dir}}}
 	must(t, s.SaveLibraries([]store.Library{{ID: "lib", Name: "Movies", Type: "movies", Path: dir}}))
+	must(t, s.AddUserPolicy("admin", "pass", true, false, 0))
 	must(t, s.UpsertItem(store.Item{ID: "m1", LibraryID: "lib", ParentID: "lib", Type: "Movie", Name: "Dune", Path: filepath.Join(dir, "Dune.mkv"), Container: "mkv", GenresJSON: `["Science Fiction"]`, StudiosJSON: `["Legendary Pictures"]`, PeopleJSON: `[{"Name":"Denis Villeneuve","Role":"Director","Type":"Director"}]`, TaglinesJSON: `["It begins"]`, ExternalURLsJSON: `[{"Name":"IMDb","URL":"https://www.imdb.com/title/tt1160419/"}]`, CommunityRating: 8.1, OfficialRating: "PG-13", RuntimeTicks: 93000000000, ProviderIDsJSON: `{"Tmdb":"438631"}`}))
 	h := API{C: c, S: s}.Handler()
-	page := get(t, h, "/Items?IncludeItemTypes=Movie", nil, http.StatusOK)
+	head := login(t, h)
+	page := get(t, h, "/Items?IncludeItemTypes=Movie", head, http.StatusOK)
 	movie := page["Items"].([]any)[0].(map[string]any)
 	if len(movie["Genres"].([]any)) != 1 || len(movie["People"].([]any)) != 1 || movie["RunTimeTicks"].(float64) == 0 {
 		t.Fatalf("missing rich metadata: %#v", movie)
@@ -41,42 +45,46 @@ func TestPeopleDTOAndImageRedirect(t *testing.T) {
 	must(t, err)
 	defer s.Close()
 	must(t, s.SaveLibraries([]store.Library{{ID: "lib", Name: "Movies", Type: "movies", Path: dir}}))
+	must(t, s.AddUserPolicy("admin", "pass", true, false, 0))
 	must(t, s.UpsertItem(store.Item{ID: "m1", LibraryID: "lib", ParentID: "lib", Type: "Movie", Name: "Dune", PeopleJSON: `[{"Name":"Timothee Chalamet","Role":"Paul Atreides","Type":"Actor","ProfileURL":"https://image.tmdb.org/t/p/original/a.jpg","TMDBID":1190668}]`}))
 	must(t, s.SavePeople("m1", []store.Person{{TMDBID: 1190668, Name: "Timothee Chalamet", Role: "Actor", Character: "Paul Atreides", ProfileURL: "https://image.tmdb.org/t/p/original/a.jpg"}}))
 	personID := store.StableID("person", "1190668")
 	must(t, s.UpdatePersonDetails(store.Person{ID: personID, IMDBID: "nm3154303", Biography: "Actor bio", BirthDate: "1995-12-27", PlaceOfBirth: "New York", KnownDepartment: "Acting"}))
 
 	h := API{C: config.Config{Server: config.Server{ID: "server-1"}}, S: s}.Handler()
-	page := get(t, h, "/Items?IncludeItemTypes=Movie", nil, http.StatusOK)
+	head := login(t, h)
+	page := get(t, h, "/Items?IncludeItemTypes=Movie", head, http.StatusOK)
 	person := page["Items"].([]any)[0].(map[string]any)["People"].([]any)[0].(map[string]any)
 	if person["PrimaryImageTag"] == nil || person["ProviderIds"].(map[string]any)["Tmdb"] != "1190668" {
 		t.Fatalf("missing person metadata: %#v", person)
 	}
-	filtered := get(t, h, "/Items?PersonIds="+personID, nil, http.StatusOK)
+	filtered := get(t, h, "/Items?PersonIds="+personID, head, http.StatusOK)
 	if count(filtered) != 1 || firstID(filtered) != "m1" {
 		t.Fatalf("bad person filter: %#v", filtered)
 	}
-	persons := get(t, h, "/Persons?SearchTerm=timothee", nil, http.StatusOK)
+	persons := get(t, h, "/Persons?SearchTerm=timothee", head, http.StatusOK)
 	if count(persons) != 1 {
 		t.Fatalf("person count = %d", count(persons))
 	}
-	detail := get(t, h, "/Persons/Timothee%20Chalamet", nil, http.StatusOK)
+	detail := get(t, h, "/Persons/Timothee%20Chalamet", head, http.StatusOK)
 	if detail["Name"] != "Timothee Chalamet" || detail["Type"] != "Person" || detail["Overview"] != "Actor bio" || detail["RecursiveItemCount"].(float64) != 1 {
 		t.Fatalf("bad person detail: %#v", detail)
 	}
-	hints := get(t, h, "/Search/Hints?SearchTerm=timothee", nil, http.StatusOK)
+	hints := get(t, h, "/Search/Hints?SearchTerm=timothee", head, http.StatusOK)
 	if len(hints["SearchHints"].([]any)) != 1 || hints["SearchHints"].([]any)[0].(map[string]any)["Type"] != "Person" {
 		t.Fatalf("bad search hints: %#v", hints)
 	}
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/Persons/Timothee%20Chalamet/Images/Primary", nil)
+	req.Header.Set("X-Emby-Token", head["X-Emby-Token"])
 	h.ServeHTTP(w, req)
 	if w.Code != http.StatusFound || w.Header().Get("Location") != "https://image.tmdb.org/t/p/original/a.jpg" {
 		t.Fatalf("bad person image redirect: %d %q", w.Code, w.Header().Get("Location"))
 	}
 	w = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/Items/"+personID+"/Images/Primary?tag="+person["PrimaryImageTag"].(string), nil)
+	req.Header.Set("X-Emby-Token", head["X-Emby-Token"])
 	h.ServeHTTP(w, req)
 	if w.Code != http.StatusFound || w.Header().Get("Location") != "https://image.tmdb.org/t/p/original/a.jpg" {
 		t.Fatalf("bad Plezy person image redirect: %d %q", w.Code, w.Header().Get("Location"))
@@ -124,12 +132,13 @@ func TestSearchHintsRankAndFields(t *testing.T) {
 	must(t, err)
 	defer s.Close()
 	must(t, s.SaveLibraries([]store.Library{{ID: "lib", Name: "Movies", Type: "movies", Path: dir}}))
+	must(t, s.AddUserPolicy("admin", "pass", true, false, 0))
 	must(t, s.UpsertItem(store.Item{ID: "m1", LibraryID: "lib", ParentID: "lib", Type: "Movie", Name: "The Dune", ProductionYear: 1984}))
 	must(t, s.UpsertItem(store.Item{ID: "m2", LibraryID: "lib", ParentID: "lib", Type: "Movie", Name: "Dune", ProductionYear: 2021}))
 	must(t, s.UpsertImage(store.Image{ItemID: "m2", Type: "Primary", Path: "poster.jpg", Tag: "poster-tag"}))
 
 	h := API{C: config.Config{Server: config.Server{ID: "server-1"}}, S: s}.Handler()
-	hints := get(t, h, "/Search/Hints?SearchTerm=dune", nil, http.StatusOK)["SearchHints"].([]any)
+	hints := get(t, h, "/Search/Hints?SearchTerm=dune", login(t, h), http.StatusOK)["SearchHints"].([]any)
 	if len(hints) != 2 {
 		t.Fatalf("hint count = %d", len(hints))
 	}
@@ -205,6 +214,7 @@ func TestShowEpisodesAreOrderedByEpisodeNumber(t *testing.T) {
 	must(t, err)
 	defer s.Close()
 	must(t, s.SaveLibraries([]store.Library{{ID: "tv", Name: "TV", Type: "tvshows", Path: dir}}))
+	must(t, s.AddUserPolicy("admin", "pass", true, false, 0))
 	must(t, s.UpsertItem(store.Item{ID: "show", LibraryID: "tv", ParentID: "tv", Type: "Series", Name: "Show", IsFolder: true}))
 	must(t, s.UpsertItem(store.Item{ID: "season", LibraryID: "tv", ParentID: "show", Type: "Season", Name: "Season 1", IsFolder: true, IndexNumber: 1}))
 	must(t, s.UpsertItem(store.Item{ID: "e10", LibraryID: "tv", ParentID: "season", Type: "Episode", Name: "A title", IndexNumber: 10, ParentIndexNumber: 1}))
@@ -213,7 +223,7 @@ func TestShowEpisodesAreOrderedByEpisodeNumber(t *testing.T) {
 	must(t, s.UpsertImage(store.Image{ItemID: "show", Type: "Primary", Path: "poster.jpg", Tag: "series-poster"}))
 	must(t, s.UpsertImage(store.Image{ItemID: "show", Type: "Backdrop", Path: "backdrop.jpg", Tag: "series-backdrop"}))
 	h := API{C: config.Config{Server: config.Server{ID: "server-1"}}, S: s}.Handler()
-	items := get(t, h, "/Shows/show/Episodes", nil, http.StatusOK)["Items"].([]any)
+	items := get(t, h, "/Shows/show/Episodes", login(t, h), http.StatusOK)["Items"].([]any)
 	if len(items) != 3 || items[0].(map[string]any)["Id"] != "e1" || items[1].(map[string]any)["Id"] != "e2" || items[2].(map[string]any)["Id"] != "e10" {
 		t.Fatalf("episodes are not in numeric order: %#v", items)
 	}
@@ -288,6 +298,9 @@ func TestFavoritesAndChildPolicy(t *testing.T) {
 	if count(people) != 0 {
 		t.Fatalf("child people saw blocked person: %#v", people)
 	}
+	blockedPersonID := store.StableID("person", "Blocked Actor")
+	status(t, h, http.MethodGet, "/Persons/Blocked%20Actor/Images/Primary", childHead, nil, http.StatusNotFound)
+	status(t, h, http.MethodGet, "/Items/"+blockedPersonID+"/Images/Primary", childHead, nil, http.StatusNotFound)
 	ratings := get(t, h, "/Localization/ParentalRatings", childHead, http.StatusOK)["Items"].([]any)
 	if len(ratings) == 0 {
 		t.Fatal("missing parental ratings")
@@ -297,6 +310,50 @@ func TestFavoritesAndChildPolicy(t *testing.T) {
 	h.ServeHTTP(stream, req)
 	if stream.Code != http.StatusForbidden {
 		t.Fatalf("child stream = %d, want 403", stream.Code)
+	}
+}
+
+func TestLoginLimiter(t *testing.T) {
+	limiter := newLoginLimiter()
+	now := time.Now()
+	for i := 0; i < 10; i++ {
+		if ok, _ := limiter.allow("192.0.2.1:1234", now); !ok {
+			t.Fatalf("attempt %d unexpectedly limited", i+1)
+		}
+	}
+	if ok, retry := limiter.allow("192.0.2.1:1234", now); ok || retry <= 0 {
+		t.Fatalf("limiter result = %t, %s", ok, retry)
+	}
+	if ok, _ := limiter.allow("192.0.2.1:1234", now.Add(time.Minute)); !ok {
+		t.Fatal("limiter did not reset after a minute")
+	}
+}
+
+func TestMediaRequiresAuthAndNeverServesFolders(t *testing.T) {
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "gofin.db"))
+	must(t, err)
+	defer s.Close()
+	must(t, s.SaveLibraries([]store.Library{{ID: "lib", Name: "Movies", Type: "movies", Path: dir}}))
+	must(t, s.AddUserPolicy("admin", "pass", true, false, 0))
+	must(t, s.UpsertItem(store.Item{ID: "folder", LibraryID: "lib", ParentID: "lib", Type: "Folder", Name: "Folder", Path: dir}))
+	h := API{S: s}.Handler()
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/Items", nil))
+	if w.Header().Get("X-Content-Type-Options") != "nosniff" || w.Header().Get("X-Frame-Options") != "DENY" {
+		t.Fatalf("missing security headers: %#v", w.Header())
+	}
+	status(t, h, http.MethodGet, "/Videos/folder/stream", nil, nil, http.StatusUnauthorized)
+	status(t, h, http.MethodGet, "/Items", nil, nil, http.StatusUnauthorized)
+	status(t, h, http.MethodGet, "/Videos/folder/stream", login(t, h), nil, http.StatusNotFound)
+
+	badUser := httptest.NewRecorder()
+	h.ServeHTTP(badUser, httptest.NewRequest(http.MethodPost, "/Users/AuthenticateByName", strings.NewReader(`{"Username":"missing","Pw":"pass"}`)))
+	badPassword := httptest.NewRecorder()
+	h.ServeHTTP(badPassword, httptest.NewRequest(http.MethodPost, "/Users/AuthenticateByName", strings.NewReader(`{"Username":"admin","Pw":"wrong"}`)))
+	if badUser.Code != http.StatusUnauthorized || badPassword.Code != http.StatusUnauthorized || badUser.Body.String() != badPassword.Body.String() {
+		t.Fatalf("authentication failures differ: %d %q, %d %q", badUser.Code, badUser.Body.String(), badPassword.Code, badPassword.Body.String())
 	}
 }
 
@@ -356,7 +413,7 @@ func TestPlezyBaseFlow(t *testing.T) {
 	defer s.Close()
 	c := config.Config{Server: config.Server{Name: "GoFin Test", ID: "server-1"}, Libraries: []config.Library{{Name: "Movies", Type: "movies", Path: movies}, {Name: "TV Shows", Type: "tvshows", Path: tv}}}
 	must(t, s.AddUserPolicy("admin", "pass", true, false, 0))
-	must(t, (library.Scanner{Store: s}).Scan(c.Libraries, ""))
+	must(t, (library.Scanner{Store: s}).ScanContext(context.Background(), c.Libraries, ""))
 	h := API{C: c, S: s}.Handler()
 
 	get(t, h, "/System/Info/Public", nil, http.StatusOK)
@@ -452,6 +509,12 @@ func get(t *testing.T, h http.Handler, path string, headers map[string]string, w
 	return do(t, h, req, want)
 }
 
+func login(t *testing.T, h http.Handler) map[string]string {
+	t.Helper()
+	auth := post(t, h, "/Users/AuthenticateByName", nil, []byte(`{"Username":"admin","Pw":"pass"}`), http.StatusOK)
+	return map[string]string{"X-Emby-Token": auth["AccessToken"].(string)}
+}
+
 func post(t *testing.T, h http.Handler, path string, headers map[string]string, body []byte, want int) map[string]any {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
@@ -501,4 +564,107 @@ func must(t *testing.T, err error) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+// musicStore builds a one-album music library with a real file on disk so the
+// stream handler has something to serve.
+func musicStore(t *testing.T) (*store.Store, string) {
+	t.Helper()
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "gofin.db"))
+	must(t, err)
+	must(t, s.SaveLibraries([]store.Library{{ID: "lib", Name: "Music", Type: "music", Path: dir}}))
+	must(t, s.AddUserPolicy("admin", "pass", true, false, 0))
+	track := filepath.Join(dir, "01.flac")
+	must(t, os.WriteFile(track, []byte("fLaC-audio-bytes"), 0600))
+	must(t, s.UpsertItem(store.Item{ID: "artist", LibraryID: "lib", ParentID: "lib", Type: "MusicArtist", Name: "New Order", IsFolder: true, AlbumArtist: "New Order", ArtistsJSON: `["New Order"]`}))
+	must(t, s.UpsertItem(store.Item{ID: "album", LibraryID: "lib", ParentID: "artist", Type: "MusicAlbum", Name: "Power", IsFolder: true, ProductionYear: 1983, Album: "Power", AlbumArtist: "New Order", ArtistsJSON: `["New Order"]`, GenresJSON: `["Post-Punk"]`}))
+	must(t, s.UpsertItem(store.Item{ID: "track", LibraryID: "lib", ParentID: "album", Type: "Audio", Name: "Blue Monday", Path: track, Container: "flac", IndexNumber: 1, ParentIndexNumber: 1, RuntimeTicks: 10000000, Album: "Power", AlbumArtist: "New Order", ArtistsJSON: `["New Order"]`, GenresJSON: `["Post-Punk"]`}))
+	return s, dir
+}
+
+func TestMusicBrowseAndStream(t *testing.T) {
+	s, _ := musicStore(t)
+	defer s.Close()
+	h := API{C: config.Config{Server: config.Server{ID: "server-1"}}, S: s}.Handler()
+	head := login(t, h)
+
+	views := get(t, h, "/UserViews", head, http.StatusOK)["Items"].([]any)
+	if views[0].(map[string]any)["CollectionType"] != "music" {
+		t.Fatalf("bad collection type: %#v", views[0])
+	}
+	artists := get(t, h, "/Artists", head, http.StatusOK)
+	if count(artists) != 1 || firstID(artists) != "artist" {
+		t.Fatalf("artists = %#v", artists)
+	}
+	if a := get(t, h, "/Artists/AlbumArtists", head, http.StatusOK); count(a) != 1 {
+		t.Fatalf("album artists = %#v", a)
+	}
+	one := get(t, h, "/Artists/New%20Order", head, http.StatusOK)
+	if one["Id"] != "artist" || one["Type"] != "MusicArtist" {
+		t.Fatalf("artist detail = %#v", one)
+	}
+	status(t, h, http.MethodGet, "/Artists/Nobody", head, nil, http.StatusNotFound)
+
+	albums := get(t, h, "/Items?ParentId=artist&IncludeItemTypes=MusicAlbum", head, http.StatusOK)
+	album := albums["Items"].([]any)[0].(map[string]any)
+	if album["AlbumArtist"] != "New Order" || album["Album"] != "Power" || album["MediaType"] != "Unknown" {
+		t.Fatalf("album dto = %#v", album)
+	}
+
+	tracks := get(t, h, "/Items?ParentId=album&IncludeItemTypes=Audio", head, http.StatusOK)
+	track := tracks["Items"].([]any)[0].(map[string]any)
+	if track["MediaType"] != "Audio" || track["Album"] != "Power" || track["AlbumId"] != "album" ||
+		track["AlbumArtist"] != "New Order" || track["IndexNumber"].(float64) != 1 {
+		t.Fatalf("track dto = %#v", track)
+	}
+	if artistItems := track["ArtistItems"].([]any); len(artistItems) != 1 || artistItems[0].(map[string]any)["Name"] != "New Order" {
+		t.Fatalf("artist items = %#v", track["ArtistItems"])
+	}
+	source := track["MediaSources"].([]any)[0].(map[string]any)
+	if !strings.HasPrefix(source["DirectStreamUrl"].(string), "/Audio/track/stream") {
+		t.Fatalf("audio must stream from the audio route: %#v", source)
+	}
+
+	genres := get(t, h, "/MusicGenres", head, http.StatusOK)
+	if count(genres) != 1 || genres["Items"].([]any)[0].(map[string]any)["Name"] != "Post-Punk" {
+		t.Fatalf("music genres = %#v", genres)
+	}
+	counts := get(t, h, "/Items/Counts", head, http.StatusOK)
+	if counts["SongCount"].(float64) != 1 || counts["AlbumCount"].(float64) != 1 || counts["ArtistCount"].(float64) != 1 {
+		t.Fatalf("counts = %#v", counts)
+	}
+	// A music library's home row shows albums, not one card per track.
+	latest := get(t, h, "/Items/Latest?ParentId=lib", head, http.StatusOK)["Items"].([]any)
+	if len(latest) != 1 || latest[0].(map[string]any)["Id"] != "album" {
+		t.Fatalf("latest = %#v", latest)
+	}
+}
+
+// Every audio route Jellyfin clients use must return the original bytes, with
+// a container-accurate type and range support so seeking works.
+func TestAudioStreamRoutes(t *testing.T) {
+	s, _ := musicStore(t)
+	defer s.Close()
+	h := API{C: config.Config{Server: config.Server{ID: "server-1"}}, S: s}.Handler()
+	head := login(t, h)
+
+	for _, path := range []string{"/Audio/track/stream", "/Audio/track/stream.flac", "/Audio/track/universal"} {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("X-Emby-Token", head["X-Emby-Token"])
+		h.ServeHTTP(w, req)
+		if w.Code != http.StatusOK || w.Body.String() != "fLaC-audio-bytes" {
+			t.Fatalf("%s = %d %q", path, w.Code, w.Body.String())
+		}
+		if got := w.Header().Get("Content-Type"); got != "audio/flac" {
+			t.Fatalf("%s content type = %q", path, got)
+		}
+		if w.Header().Get("Accept-Ranges") != "bytes" {
+			t.Fatalf("%s cannot be seeked: %#v", path, w.Header())
+		}
+	}
+	status(t, h, http.MethodGet, "/Audio/track/stream", nil, nil, http.StatusUnauthorized)
+	// A folder has no bytes to serve even though the item exists.
+	status(t, h, http.MethodGet, "/Audio/album/stream", head, nil, http.StatusNotFound)
 }

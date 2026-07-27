@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -16,6 +17,13 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	_ "modernc.org/sqlite"
 )
+
+// ErrInvalidCredentials is returned for every rejected login attempt.
+var ErrInvalidCredentials = errors.New("invalid credentials")
+
+// This is a bcrypt hash for a fixed, non-secret value. Comparing it when a
+// user is absent keeps failed-login work close to the wrong-password path.
+const dummyPasswordHash = "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
 
 type Store struct{ DB *sql.DB }
 
@@ -36,6 +44,7 @@ type Item struct {
 	DateCreated, PremiereDate, Overview, ProviderIDsJSON                string
 	GenresJSON, StudiosJSON, PeopleJSON, TaglinesJSON, ExternalURLsJSON string
 	OfficialRating, Container, LastSeenScan                             string
+	Album, AlbumArtist, ArtistsJSON                                     string
 	IsFolder                                                            bool
 	ProductionYear, IndexNumber, ParentIndexNumber                      int
 	Size, RuntimeTicks, MTimeUnix                                       int64
@@ -61,7 +70,7 @@ type PersonQuery struct {
 
 type ItemQuery struct {
 	ParentID, Type, Search, SortBy, SortOrder, PersonIDs, Genres, OfficialRatings, Years, NameStartsWith string
-	UserID                                                                                               string
+	UserID, Name                                                                                         string
 	Recursive                                                                                            bool
 	Favorite, Played, Unplayed                                                                           bool
 	Start, Limit                                                                                         int
@@ -84,6 +93,7 @@ func (s *Store) Migrate() error {
 	}
 	for _, c := range []string{
 		"genres_json TEXT", "studios_json TEXT", "people_json TEXT", "taglines_json TEXT", "external_urls_json TEXT", "community_rating REAL", "official_rating TEXT", "last_seen_scan TEXT",
+		"album TEXT", "album_artist TEXT", "artists_json TEXT",
 	} {
 		if err := s.addColumn("items", c); err != nil {
 			return err
@@ -106,7 +116,54 @@ func (s *Store) Migrate() error {
 			return err
 		}
 	}
-	return nil
+	return s.migratePlaybackState()
+}
+
+// Keep watch history when a scan temporarily removes an item, such as while a
+// media mount is unavailable. Stable item IDs reconnect these rows on rescan.
+func (s *Store) migratePlaybackState() error {
+	rows, err := s.DB.Query(`PRAGMA foreign_key_list(playback_state)`)
+	if err != nil {
+		return err
+	}
+	hasItemFK := false
+	for rows.Next() {
+		var id, seq int
+		var table, from, to, onUpdate, onDelete, match string
+		if err := rows.Scan(&id, &seq, &table, &from, &to, &onUpdate, &onDelete, &match); err != nil {
+			return err
+		}
+		if table != "items" {
+			continue
+		}
+		hasItemFK = true
+		break
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil || !hasItemFK {
+		return err
+	}
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, q := range []string{
+		`CREATE TABLE playback_state_new (user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, item_id TEXT NOT NULL, played INTEGER NOT NULL DEFAULT 0, play_count INTEGER NOT NULL DEFAULT 0, playback_position_ticks INTEGER NOT NULL DEFAULT 0, is_favorite INTEGER NOT NULL DEFAULT 0, likes INTEGER, last_played_at TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(user_id, item_id))`,
+		`INSERT INTO playback_state_new SELECT user_id,item_id,played,play_count,playback_position_ticks,is_favorite,likes,last_played_at,updated_at FROM playback_state`,
+		`DROP TABLE playback_state`,
+		`ALTER TABLE playback_state_new RENAME TO playback_state`,
+		`CREATE INDEX idx_playback_favorite ON playback_state(user_id, is_favorite)`,
+		`CREATE INDEX idx_playback_played ON playback_state(user_id, played)`,
+	} {
+		if _, err := tx.Exec(q); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) SaveLibraries(libs []Library) error {
@@ -175,10 +232,10 @@ func (s *Store) UpsertItem(it Item) error {
 	if it.SortName == "" {
 		it.SortName = strings.ToLower(it.Name)
 	}
-	_, err := s.DB.Exec(`INSERT INTO items(id,library_id,parent_id,type,name,sort_name,path,relative_path,is_folder,production_year,premiere_date,overview,index_number,parent_index_number,date_created,provider_ids_json,genres_json,studios_json,people_json,taglines_json,external_urls_json,community_rating,official_rating,runtime_ticks,last_seen_scan)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-			ON CONFLICT(id) DO UPDATE SET parent_id=excluded.parent_id,type=excluded.type,name=excluded.name,sort_name=excluded.sort_name,path=excluded.path,relative_path=excluded.relative_path,is_folder=excluded.is_folder,production_year=COALESCE(excluded.production_year,items.production_year),premiere_date=COALESCE(excluded.premiere_date,items.premiere_date),overview=COALESCE(excluded.overview,items.overview),index_number=COALESCE(excluded.index_number,items.index_number),parent_index_number=COALESCE(excluded.parent_index_number,items.parent_index_number),provider_ids_json=COALESCE(excluded.provider_ids_json,items.provider_ids_json),genres_json=COALESCE(excluded.genres_json,items.genres_json),studios_json=COALESCE(excluded.studios_json,items.studios_json),people_json=COALESCE(excluded.people_json,items.people_json),taglines_json=COALESCE(excluded.taglines_json,items.taglines_json),external_urls_json=COALESCE(excluded.external_urls_json,items.external_urls_json),community_rating=COALESCE(excluded.community_rating,items.community_rating),official_rating=COALESCE(excluded.official_rating,items.official_rating),runtime_ticks=COALESCE(excluded.runtime_ticks,items.runtime_ticks),last_seen_scan=COALESCE(excluded.last_seen_scan,items.last_seen_scan)`,
-		it.ID, it.LibraryID, nullEmpty(it.ParentID), it.Type, it.Name, it.SortName, nullEmpty(it.Path), nullEmpty(it.RelativePath), folder, nullZero(it.ProductionYear), nullEmpty(it.PremiereDate), nullEmpty(it.Overview), nullZero(it.IndexNumber), nullZero(it.ParentIndexNumber), now, nullEmpty(it.ProviderIDsJSON), nullEmpty(it.GenresJSON), nullEmpty(it.StudiosJSON), nullEmpty(it.PeopleJSON), nullEmpty(it.TaglinesJSON), nullEmpty(it.ExternalURLsJSON), nullFloat(it.CommunityRating), nullEmpty(it.OfficialRating), nullInt64(it.RuntimeTicks), nullEmpty(it.LastSeenScan))
+	_, err := s.DB.Exec(`INSERT INTO items(id,library_id,parent_id,type,name,sort_name,path,relative_path,is_folder,production_year,premiere_date,overview,index_number,parent_index_number,date_created,provider_ids_json,genres_json,studios_json,people_json,taglines_json,external_urls_json,community_rating,official_rating,runtime_ticks,last_seen_scan,album,album_artist,artists_json)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			ON CONFLICT(id) DO UPDATE SET parent_id=excluded.parent_id,type=excluded.type,name=excluded.name,sort_name=excluded.sort_name,path=excluded.path,relative_path=excluded.relative_path,is_folder=excluded.is_folder,production_year=COALESCE(excluded.production_year,items.production_year),premiere_date=COALESCE(excluded.premiere_date,items.premiere_date),overview=COALESCE(excluded.overview,items.overview),index_number=COALESCE(excluded.index_number,items.index_number),parent_index_number=COALESCE(excluded.parent_index_number,items.parent_index_number),provider_ids_json=COALESCE(excluded.provider_ids_json,items.provider_ids_json),genres_json=COALESCE(excluded.genres_json,items.genres_json),studios_json=COALESCE(excluded.studios_json,items.studios_json),people_json=COALESCE(excluded.people_json,items.people_json),taglines_json=COALESCE(excluded.taglines_json,items.taglines_json),external_urls_json=COALESCE(excluded.external_urls_json,items.external_urls_json),community_rating=COALESCE(excluded.community_rating,items.community_rating),official_rating=COALESCE(excluded.official_rating,items.official_rating),runtime_ticks=COALESCE(excluded.runtime_ticks,items.runtime_ticks),last_seen_scan=COALESCE(excluded.last_seen_scan,items.last_seen_scan),album=COALESCE(excluded.album,items.album),album_artist=COALESCE(excluded.album_artist,items.album_artist),artists_json=COALESCE(excluded.artists_json,items.artists_json)`,
+		it.ID, it.LibraryID, nullEmpty(it.ParentID), it.Type, it.Name, it.SortName, nullEmpty(it.Path), nullEmpty(it.RelativePath), folder, nullZero(it.ProductionYear), nullEmpty(it.PremiereDate), nullEmpty(it.Overview), nullZero(it.IndexNumber), nullZero(it.ParentIndexNumber), now, nullEmpty(it.ProviderIDsJSON), nullEmpty(it.GenresJSON), nullEmpty(it.StudiosJSON), nullEmpty(it.PeopleJSON), nullEmpty(it.TaglinesJSON), nullEmpty(it.ExternalURLsJSON), nullFloat(it.CommunityRating), nullEmpty(it.OfficialRating), nullInt64(it.RuntimeTicks), nullEmpty(it.LastSeenScan), nullEmpty(it.Album), nullEmpty(it.AlbumArtist), nullEmpty(it.ArtistsJSON))
 	if err != nil {
 		return err
 	}
@@ -273,15 +330,6 @@ func (s *Store) SavePeople(itemID string, people []Person) error {
 		}
 	}
 	return tx.Commit()
-}
-
-func (s *Store) PersonImage(name string) (string, error) {
-	var out string
-	err := s.DB.QueryRow(`SELECT COALESCE(profile_url,'') FROM people WHERE name=? COLLATE NOCASE AND COALESCE(profile_url,'')<>'' LIMIT 1`, name).Scan(&out)
-	if err == sql.ErrNoRows {
-		return "", nil
-	}
-	return out, err
 }
 
 func (s *Store) PersonImageByID(id string) (string, error) {
@@ -451,6 +499,10 @@ func (s *Store) Items(q ItemQuery) ([]Item, error) {
 		sqlq += ` AND i.name LIKE ?`
 		args = append(args, "%"+q.Search+"%")
 	}
+	if q.Name != "" {
+		sqlq += ` AND i.name=? COLLATE NOCASE`
+		args = append(args, q.Name)
+	}
 	if q.NameStartsWith != "" {
 		sqlq += ` AND i.name LIKE ? COLLATE NOCASE`
 		args = append(args, q.NameStartsWith+"%")
@@ -512,6 +564,17 @@ func (s *Store) Items(q ItemQuery) ([]Item, error) {
 		args = append(args, q.Start)
 	}
 	rows, err := s.DB.Query(sqlq, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanItems(rows)
+}
+
+func (s *Store) EpisodesForSeries(seriesID string) ([]Item, error) {
+	rows, err := s.DB.Query(selectItem+` JOIN items se ON se.id=i.parent_id
+		WHERE i.type='Episode' AND se.parent_id=?
+		ORDER BY COALESCE(i.parent_index_number,se.index_number,0), COALESCE(i.index_number,0), i.sort_name`, seriesID)
 	if err != nil {
 		return nil, err
 	}
@@ -772,10 +835,14 @@ func (s *Store) AuthDevice(name, pass, deviceID, deviceName, client string) (Use
 	var admin, child int
 	err := s.DB.QueryRow(`SELECT id,name,password_hash,is_admin,is_child,max_parental_rating FROM users WHERE name=?`, name).Scan(&u.ID, &u.Name, &hash, &admin, &child, &u.MaxParentalRating)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			_ = bcrypt.CompareHashAndPassword([]byte(dummyPasswordHash), []byte(pass))
+			return u, "", ErrInvalidCredentials
+		}
 		return u, "", err
 	}
 	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(pass)) != nil {
-		return u, "", errors.New("bad password")
+		return u, "", ErrInvalidCredentials
 	}
 	u.IsAdmin = admin == 1
 	u.IsChild = child == 1
@@ -784,13 +851,29 @@ func (s *Store) AuthDevice(name, pass, deviceID, deviceName, client string) (Use
 	return u, token, err
 }
 
-func (s *Store) UserByToken(token string) (User, error) {
+func (s *Store) PersonByID(id string) (Person, error) {
+	rows, err := s.DB.Query(selectPerson+` FROM people p WHERE p.id=? LIMIT 1`, id)
+	if err != nil {
+		return Person{}, err
+	}
+	defer rows.Close()
+	people, err := scanPeople(rows)
+	if err != nil {
+		return Person{}, err
+	}
+	if len(people) == 0 {
+		return Person{}, sql.ErrNoRows
+	}
+	return people[0], nil
+}
+
+func (s *Store) UserByTokenContext(ctx context.Context, token string) (User, error) {
 	var u User
 	var admin, child int
 	hash := tokenHash(token)
-	err := s.DB.QueryRow(`SELECT u.id,u.name,u.is_admin,u.is_child,u.max_parental_rating FROM users u JOIN auth_tokens t ON t.user_id=u.id WHERE t.token_hash=?`, hash).Scan(&u.ID, &u.Name, &admin, &child, &u.MaxParentalRating)
+	err := s.DB.QueryRowContext(ctx, `SELECT u.id,u.name,u.is_admin,u.is_child,u.max_parental_rating FROM users u JOIN auth_tokens t ON t.user_id=u.id WHERE t.token_hash=?`, hash).Scan(&u.ID, &u.Name, &admin, &child, &u.MaxParentalRating)
 	if err == nil {
-		_, _ = s.DB.Exec(`UPDATE auth_tokens SET last_seen_at=? WHERE token_hash=?`, time.Now().UTC().Format(time.RFC3339), hash)
+		_, _ = s.DB.ExecContext(ctx, `UPDATE auth_tokens SET last_seen_at=? WHERE token_hash=?`, time.Now().UTC().Format(time.RFC3339), hash)
 	}
 	u.IsAdmin = admin == 1
 	u.IsChild = child == 1
@@ -870,7 +953,7 @@ func scanItems(rows *sql.Rows) ([]Item, error) {
 	for rows.Next() {
 		var it Item
 		var folder int
-		if err := rows.Scan(&it.ID, &it.LibraryID, &it.ParentID, &it.Type, &it.Name, &it.SortName, &it.Path, &it.RelativePath, &folder, &it.ProductionYear, &it.PremiereDate, &it.Overview, &it.IndexNumber, &it.ParentIndexNumber, &it.DateCreated, &it.ProviderIDsJSON, &it.GenresJSON, &it.StudiosJSON, &it.PeopleJSON, &it.TaglinesJSON, &it.ExternalURLsJSON, &it.CommunityRating, &it.OfficialRating, &it.RuntimeTicks, &it.LastSeenScan, &it.Size, &it.MTimeUnix, &it.Container); err != nil {
+		if err := rows.Scan(&it.ID, &it.LibraryID, &it.ParentID, &it.Type, &it.Name, &it.SortName, &it.Path, &it.RelativePath, &folder, &it.ProductionYear, &it.PremiereDate, &it.Overview, &it.IndexNumber, &it.ParentIndexNumber, &it.DateCreated, &it.ProviderIDsJSON, &it.GenresJSON, &it.StudiosJSON, &it.PeopleJSON, &it.TaglinesJSON, &it.ExternalURLsJSON, &it.CommunityRating, &it.OfficialRating, &it.RuntimeTicks, &it.LastSeenScan, &it.Album, &it.AlbumArtist, &it.ArtistsJSON, &it.Size, &it.MTimeUnix, &it.Container); err != nil {
 			return nil, err
 		}
 		it.IsFolder = folder == 1
@@ -891,7 +974,7 @@ func scanPeople(rows *sql.Rows) ([]Person, error) {
 	return out, rows.Err()
 }
 
-const selectItem = `SELECT i.id,i.library_id,COALESCE(i.parent_id,''),i.type,i.name,i.sort_name,COALESCE(i.path,''),COALESCE(i.relative_path,''),i.is_folder,COALESCE(i.production_year,0),COALESCE(i.premiere_date,''),COALESCE(i.overview,''),COALESCE(i.index_number,0),COALESCE(i.parent_index_number,0),i.date_created,COALESCE(i.provider_ids_json,''),COALESCE(i.genres_json,''),COALESCE(i.studios_json,''),COALESCE(i.people_json,''),COALESCE(i.taglines_json,''),COALESCE(i.external_urls_json,''),COALESCE(i.community_rating,0),COALESCE(i.official_rating,''),COALESCE(i.runtime_ticks,0),COALESCE(i.last_seen_scan,''),COALESCE(ms.size_bytes,0),COALESCE(ms.mtime_unix,0),COALESCE(ms.container,'') FROM items i LEFT JOIN media_sources ms ON ms.item_id=i.id`
+const selectItem = `SELECT i.id,i.library_id,COALESCE(i.parent_id,''),i.type,i.name,i.sort_name,COALESCE(i.path,''),COALESCE(i.relative_path,''),i.is_folder,COALESCE(i.production_year,0),COALESCE(i.premiere_date,''),COALESCE(i.overview,''),COALESCE(i.index_number,0),COALESCE(i.parent_index_number,0),i.date_created,COALESCE(i.provider_ids_json,''),COALESCE(i.genres_json,''),COALESCE(i.studios_json,''),COALESCE(i.people_json,''),COALESCE(i.taglines_json,''),COALESCE(i.external_urls_json,''),COALESCE(i.community_rating,0),COALESCE(i.official_rating,''),COALESCE(i.runtime_ticks,0),COALESCE(i.last_seen_scan,''),COALESCE(i.album,''),COALESCE(i.album_artist,''),COALESCE(i.artists_json,''),COALESCE(ms.size_bytes,0),COALESCE(ms.mtime_unix,0),COALESCE(ms.container,'') FROM items i LEFT JOIN media_sources ms ON ms.item_id=i.id`
 const selectPerson = `SELECT p.id,COALESCE(p.tmdb_id,0),COALESCE(p.imdb_id,''),p.name,COALESCE(p.profile_url,''),COALESCE(p.biography,''),COALESCE(p.birth_date,''),COALESCE(p.death_date,''),COALESCE(p.place_of_birth,''),COALESCE(p.known_for_department,''),p.updated_at`
 
 func StableID(parts ...string) string {
@@ -990,8 +1073,9 @@ CREATE TABLE IF NOT EXISTS media_sources (id TEXT PRIMARY KEY, item_id TEXT NOT 
 CREATE TABLE IF NOT EXISTS images (id TEXT PRIMARY KEY, item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, image_type TEXT NOT NULL, image_index INTEGER NOT NULL DEFAULT 0, path TEXT NOT NULL, tag TEXT NOT NULL, width INTEGER, height INTEGER, mime_type TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(item_id, image_type, image_index));
 CREATE TABLE IF NOT EXISTS people (id TEXT PRIMARY KEY, tmdb_id INTEGER UNIQUE, imdb_id TEXT, name TEXT NOT NULL, profile_url TEXT, biography TEXT, birth_date TEXT, death_date TEXT, place_of_birth TEXT, known_for_department TEXT, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS item_people (item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE, role TEXT NOT NULL, character TEXT NOT NULL DEFAULT '', sort_order INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(item_id, person_id, role, character));
-CREATE TABLE IF NOT EXISTS playback_state (user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, played INTEGER NOT NULL DEFAULT 0, play_count INTEGER NOT NULL DEFAULT 0, playback_position_ticks INTEGER NOT NULL DEFAULT 0, is_favorite INTEGER NOT NULL DEFAULT 0, likes INTEGER, last_played_at TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(user_id, item_id));
+CREATE TABLE IF NOT EXISTS playback_state (user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, item_id TEXT NOT NULL, played INTEGER NOT NULL DEFAULT 0, play_count INTEGER NOT NULL DEFAULT 0, playback_position_ticks INTEGER NOT NULL DEFAULT 0, is_favorite INTEGER NOT NULL DEFAULT 0, likes INTEGER, last_played_at TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(user_id, item_id));
 CREATE INDEX IF NOT EXISTS idx_items_library_parent ON items(library_id, parent_id);
+CREATE INDEX IF NOT EXISTS idx_items_parent_id ON items(parent_id);
 CREATE INDEX IF NOT EXISTS idx_items_library_seen ON items(library_id, last_seen_scan);
 CREATE INDEX IF NOT EXISTS idx_items_type ON items(type);
 CREATE INDEX IF NOT EXISTS idx_items_sort_name ON items(sort_name);

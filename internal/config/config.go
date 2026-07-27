@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 )
 
 type Config struct {
@@ -48,7 +49,7 @@ func Default() Config {
 	return Config{
 		Server:    Server{Name: "GoFin", ID: randID(), Address: "0.0.0.0:8096"},
 		Database:  Database{Path: "gofin.db"},
-		Libraries: []Library{{Name: "Movies", Type: "movies", Path: "/media/Movies"}, {Name: "TV Shows", Type: "tvshows", Path: "/media/TV"}},
+		Libraries: []Library{{Name: "Movies", Type: "movies", Path: "/media/Movies"}, {Name: "TV Shows", Type: "tvshows", Path: "/media/TV"}, {Name: "Music", Type: "music", Path: "/media/Music"}},
 		Metadata:  Metadata{Enabled: true, APIKeyEnv: "TMDB_API_KEY", Language: "en-US"},
 	}
 }
@@ -66,16 +67,58 @@ func Load(path string) (Config, error) {
 	if c.Database.Path == "" {
 		return c, errors.New("database.path is required")
 	}
+	if err := validateLibraries(c.Libraries); err != nil {
+		return c, err
+	}
 	return c, nil
 }
 
-func SaveDefault(path string) error {
+// libraryTypes are the collection types a library may declare. They match the
+// Jellyfin collection names clients expect back from /UserViews.
+var libraryTypes = map[string]bool{"movies": true, "tvshows": true, "music": true}
+
+func validateLibraries(libraries []Library) error {
+	paths := map[string]bool{}
+	for _, library := range libraries {
+		if library.Name == "" || library.Path == "" {
+			return errors.New("library name and path are required")
+		}
+		if !filepath.IsAbs(library.Path) {
+			return errors.New("library paths must be absolute")
+		}
+		if !libraryTypes[library.Type] {
+			return errors.New("library type must be movies, tvshows or music")
+		}
+		path := filepath.Clean(library.Path)
+		if paths[path] {
+			return errors.New("library paths must be unique")
+		}
+		paths[path] = true
+	}
+	return nil
+}
+
+func SaveDefault(path string, force bool) error {
 	c := Default()
 	b, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(b, '\n'), 0600)
+	flags := os.O_WRONLY | os.O_CREATE
+	if force {
+		flags |= os.O_TRUNC
+	} else {
+		flags |= os.O_EXCL
+	}
+	f, err := os.OpenFile(path, flags, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(append(b, '\n')); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 func Fill(c *Config) {

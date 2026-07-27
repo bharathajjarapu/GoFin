@@ -21,13 +21,6 @@ func TestSavePeople(t *testing.T) {
 	if err := s.SavePeople("m1", []Person{{TMDBID: 1190668, Name: "Timothee Chalamet", Role: "Actor", Character: "Paul", ProfileURL: "https://image.tmdb.org/t/p/original/a.jpg"}}); err != nil {
 		t.Fatal(err)
 	}
-	img, err := s.PersonImage("timothee chalamet")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if img != "https://image.tmdb.org/t/p/original/a.jpg" {
-		t.Fatalf("image = %q", img)
-	}
 	var links int
 	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM item_people WHERE item_id='m1'`).Scan(&links); err != nil {
 		t.Fatal(err)
@@ -39,7 +32,7 @@ func TestSavePeople(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(people) != 1 || people[0].TMDBID != 1190668 {
+	if len(people) != 1 || people[0].TMDBID != 1190668 || people[0].ProfileURL != "https://image.tmdb.org/t/p/original/a.jpg" {
 		t.Fatalf("people = %#v", people)
 	}
 }
@@ -65,6 +58,44 @@ func TestForeignKeysCascade(t *testing.T) {
 	}
 	if sources != 0 {
 		t.Fatalf("media sources = %d", sources)
+	}
+}
+
+func TestPlaybackSurvivesItemCleanup(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "gofin.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.SaveLibraries([]Library{{ID: "lib", Name: "Movies", Type: "movies", Path: t.TempDir()}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddUserPolicy("u", "pass", true, false, 0); err != nil {
+		t.Fatal(err)
+	}
+	item := Item{ID: "stable-item", LibraryID: "lib", ParentID: "lib", Type: "Movie", Name: "Dune"}
+	if err := s.UpsertItem(item); err != nil {
+		t.Fatal(err)
+	}
+	userID := StableID("user", "u")
+	if err := s.SaveProgress(userID, item.ID, 42, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.Exec(`DELETE FROM items WHERE id=?`, item.ID); err != nil {
+		t.Fatal(err)
+	}
+	var states int
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM playback_state WHERE user_id=? AND item_id=?`, userID, item.ID).Scan(&states); err != nil {
+		t.Fatal(err)
+	}
+	if states != 1 {
+		t.Fatalf("playback states = %d", states)
+	}
+	if err := s.UpsertItem(item); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.Playback(userID, item.ID).PositionTicks; got != 42 {
+		t.Fatalf("position = %d", got)
 	}
 }
 
@@ -126,7 +157,7 @@ func BenchmarkItemsBrowse(b *testing.B) {
 		}
 	}
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		if _, err := s.Items(ItemQuery{ParentID: "lib", Type: "Movie", SortBy: "SortName", Limit: 100}); err != nil {
 			b.Fatal(err)
 		}
