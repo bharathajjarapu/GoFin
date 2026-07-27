@@ -60,6 +60,7 @@ Examples below use:
 /srv/gofin/gofin.json  # config
 /srv/gofin/gofin.db    # SQLite database
 /srv/gofin/gofin.env   # secrets
+/srv/gofin/covers/         # cover art extracted from music files
 /srv/media/movies              # movies
 /srv/media/tv                  # TV shows
 ```
@@ -194,7 +195,7 @@ systemctl status gofin.service
 - For internet exposure, place GoFin behind a TLS reverse proxy. The server is intended for authenticated LAN use. See [Rate limiting](#rate-limiting) before you do.
 - Keep the database on local storage. Media can live on a mounted disk.
 - If your media mount is not `/srv/media`, update `RequiresMountsFor=` in the installed unit to match it.
-- Back up `/srv/gofin/gofin.db`.
+- Back up `/srv/gofin/gofin.db`. The `covers/` folder beside it is a cache of art pulled out of music files, so it needs no backup — deleting it costs one rescan.
 - Use direct play friendly files (`mkv`, `mp4`, `m4v`, `avi`, `mov`, `webm`).
 - External links are already populated from TMDB/IMDb metadata when available.
 

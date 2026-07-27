@@ -10,7 +10,9 @@ For build, local development, and production deployment with Podman or systemd, 
 
 - **Rich metadata** — posters, backdrops, cast (up to 15), crew, genres, studios, ratings, runtime, taglines, external links (TMDB/IMDb)
 - **TV show support** — series, seasons, episodes with full metadata
-- **Music support** — artists, albums and tracks read from embedded tags, with exact durations parsed from container headers (no FFmpeg, no extra dependencies)
+- **Music support** — artists, albums and tracks read from embedded tags, with exact durations, cover art and lyrics parsed from container headers (no FFmpeg, no extra dependencies)
+- **Playlists** — create, reorder and share playlists across the server
+- **Suggestions** — "more like this" scored on shared genres, cast and crew, entirely from your own library
 - **Smart scanning** — incremental rescans (skips unchanged files by size+mtime), auto-removes deleted files, background scan loop
 - **Exact provider IDs** — `[tmdbid-438631]`, `[imdbid-tt1160419]`, `[tvdbid-12345]` in filenames for zero-guess matching
 - **People database** — cast/crew stored in SQLite with TMDB profile images, lazy-loaded biographies
@@ -21,7 +23,7 @@ For build, local development, and production deployment with Podman or systemd, 
 - **Favorites** — add/remove favorites, filter by favorites
 - **Next Up** — unwatched episode queue for TV shows
 - **Filters** — by genre, rating, year, person, name prefix, favorites, played state
-- **Jellyfin API compatibility** — endpoints for /Items, /Shows, /Artists, /MusicGenres, /Persons, /Search/Hints, /Sessions, /PlaybackInfo, streaming, images, and more
+- **Jellyfin API compatibility** — endpoints for /Items, /Shows, /Artists, /Genres, /MusicGenres, /Studios, /Playlists, /Persons, /Search/Hints, /Sessions, /PlaybackInfo, streaming, images, and more
 - **No transcoding** — direct-play only, no FFmpeg required
 
 ## Configuration
@@ -60,10 +62,12 @@ Tracks are read straight from each file's embedded tags, so a well-tagged librar
 - **Containers** — `flac`, `m4a`, `m4b`, `ogg`, `oga`, `opus`. All are direct-play friendly, which is the point: the server never transcodes. Audio in an MP4 container must be named `.m4a`, matching what Jellyfin expects; an `.mp4` in a music library is ignored.
 - **Tags beat folders** — artist and album come from `ALBUMARTIST`/`ALBUM` (or their MP4 equivalents), so compilations and re-tagged files group correctly even when the directory names disagree. Folder names are only a fallback for untagged files.
 - **Durations are exact**, parsed from the container header: FLAC `STREAMINFO`, Ogg granule positions, MP4 `mvhd`. No estimation, no probing.
-- **Cover art** comes from `cover.jpg`, `folder.jpg` or `poster.jpg` in the album folder — the same precedence Jellyfin applies.
+- **Cover art** comes from `cover.jpg`, `folder.jpg` or `poster.jpg` in the album folder, and falls back to the art embedded in the tracks themselves — the same precedence Jellyfin applies. Embedded art is copied out once per album into a `covers/` folder beside the database, so serving it costs no parsing.
+- **Lyrics** are read from `LYRICS`/`UNSYNCEDLYRICS` tags and MP4 `©lyr`. `[mm:ss.xx]` timestamps are understood, so synced lyrics scroll with playback; plain text is shown as a static sheet.
 - **Multi-disc albums** use the `DISCNUMBER` tag. A track without one counts as disc 1, so a partly tagged album keeps a single running order.
+- **Multiple artists** on one track come from repeated `ARTIST` tags or a semicolon-separated list. A slash is left alone, so AC/DC stays one band.
 
-Clients stream from `/Audio/{id}/stream`, `/Audio/{id}/stream.{ext}` and `/Audio/{id}/universal`. All three return the original bytes with range support, so seeking works.
+Clients stream from `/Audio/{id}/stream`, `/Audio/{id}/stream.{ext}` and `/Audio/{id}/universal`. All three return the original bytes with range support, so seeking works. Lyrics come from `/Audio/{id}/Lyrics`.
 
 ## User types
 
@@ -90,8 +94,9 @@ GoFin is not a full Jellyfin replacement. It intentionally omits:
 For music specifically, it also omits:
 
 - **Online music metadata** — no MusicBrainz or Last.fm, tags only
-- **Playlists, Instant Mix and lyrics**
-- **Embedded cover art extraction** — external image files only
+- **Instant Mix**
+
+Playlists are shared across the server rather than owned per user, which suits a household and keeps the model small. Parental limits still apply to what a playlist contains, so a child account never sees restricted media inside a shared one.
 
 Because nothing is transcoded, a client that cannot decode a container simply will not play it. FLAC and M4A play essentially everywhere; Opus depends on the client.
 
