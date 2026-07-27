@@ -1,6 +1,7 @@
 package library
 
 import (
+	"context"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"gofin/internal/audio"
 	"gofin/internal/config"
 	"gofin/internal/metadata"
 	"gofin/internal/store"
@@ -24,13 +26,27 @@ type Scanner struct {
 
 var videoExt = map[string]bool{"mkv": true, "mp4": true, "m4v": true, "avi": true, "mov": true, "webm": true}
 var imageExt = map[string]string{"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}
+
+// playable reports whether a library of this type should index the extension.
+// The sets stay separate so that an .mp4 in a music library is ignored rather
+// than indexed as a track; Jellyfin expects audio in MP4 to be named .m4a.
+func playable(libraryType, ext string) bool {
+	if libraryType == "music" {
+		return audio.Supported(ext)
+	}
+	return videoExt[ext]
+}
+
 var epRe = regexp.MustCompile(`(?i)s(\d{1,2})e(\d{1,3})`)
 var providerRe = regexp.MustCompile(`(?i)\[(tmdbid|imdbid|tvdbid)-([^\]]+)\]`)
 
 // metadataNoMatch records that a metadata lookup was attempted without a match.
 const metadataNoMatch = "{}"
 
-func (s Scanner) Scan(libs []config.Library, only string) error {
+func (s Scanner) ScanContext(ctx context.Context, libs []config.Library, only string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.series == nil {
 		s.series = map[string]metadata.Result{}
 		s.seasons = map[string]metadata.Result{}
@@ -38,35 +54,44 @@ func (s Scanner) Scan(libs []config.Library, only string) error {
 	if s.scanID == "" {
 		s.scanID = time.Now().UTC().Format("20060102T150405.000000000Z")
 	}
+	allLibs := make([]store.Library, 0, len(libs))
 	var slibs []store.Library
 	for _, l := range libs {
+		lib := store.Library{ID: store.StableID("library", l.Path), Name: l.Name, Type: l.Type, Path: l.Path}
+		allLibs = append(allLibs, lib)
 		if info, err := os.Stat(l.Path); err != nil || !info.IsDir() {
 			continue
 		}
-		slibs = append(slibs, store.Library{ID: store.StableID("library", l.Path), Name: l.Name, Type: l.Type, Path: l.Path})
+		slibs = append(slibs, lib)
 	}
-	if err := s.Store.SaveLibraries(slibs); err != nil {
+	if err := s.Store.SaveLibraries(allLibs); err != nil {
 		return err
 	}
 	for _, l := range slibs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if only != "" && only != l.ID && !strings.EqualFold(only, l.Name) {
 			continue
 		}
-		if err := s.scanLibrary(l); err != nil {
+		if err := s.scanLibrary(ctx, l); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (s Scanner) scanLibrary(lib store.Library) error {
+func (s Scanner) scanLibrary(ctx context.Context, lib store.Library) error {
 	root := filepath.Clean(lib.Path)
 	if err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err != nil || d.IsDir() {
 			return nil
 		}
 		ext := store.Ext(path)
-		if !videoExt[ext] {
+		if !playable(lib.Type, ext) {
 			return nil
 		}
 		rel, _ := filepath.Rel(root, path)
@@ -77,19 +102,30 @@ func (s Scanner) scanLibrary(lib store.Library) error {
 		mtime := info.ModTime().Unix()
 		id := store.StableID("item", path)
 		if s.Store.Unchanged(id, info.Size(), mtime) {
-			if lib.Type == "tvshows" {
+			switch lib.Type {
+			case "music":
+				// Music metadata is embedded, so an unchanged file can never
+				// gain new tags. Keep its artist and album alive and move on.
+				_ = s.touchTrackParents(id)
+				return s.Store.TouchItem(id, s.scanID)
+			case "tvshows":
 				_ = s.touchEpisodeParents(lib, rel)
 				// Files may have been first scanned before TMDB_API_KEY was set.
 				// Retry TV items that still have no provider metadata.
 				if s.needsMetadata(id) {
 					return s.upsertEpisode(lib, path, rel, ext, info.Size(), mtime)
 				}
-			} else if s.needsMetadata(id) {
-				return s.upsertMovie(lib, path, rel, ext, info.Size(), mtime)
+			default:
+				if s.needsMetadata(id) {
+					return s.upsertMovie(lib, path, rel, ext, info.Size(), mtime)
+				}
 			}
 			return s.Store.TouchItem(id, s.scanID)
 		}
-		if lib.Type == "tvshows" {
+		switch lib.Type {
+		case "music":
+			return s.upsertTrack(lib, path, rel, ext, info.Size(), mtime)
+		case "tvshows":
 			return s.upsertEpisode(lib, path, rel, ext, info.Size(), mtime)
 		}
 		return s.upsertMovie(lib, path, rel, ext, info.Size(), mtime)
@@ -199,6 +235,78 @@ func (s Scanner) upsertEpisode(lib store.Library, path, rel, ext string, size, m
 		s.saveRemoteImages(it.ID, emd)
 	}
 	return s.saveSidecars(it.ID, path)
+}
+
+// upsertTrack indexes one audio file as Artist -> Album -> Audio, the
+// hierarchy Jellyfin clients browse. Placement comes from the embedded tags
+// and falls back to the folder layout, matching how Jellyfin treats a music
+// library: tags win, so compilations and multi-disc albums stay together even
+// when the directory names disagree.
+func (s Scanner) upsertTrack(lib store.Library, path, rel, ext string, size, mtime int64) error {
+	tags, _ := audio.Read(path)
+	folders := strings.Split(filepath.ToSlash(rel), "/")
+	artistName := firstNonEmpty(tags.AlbumArtist, first(tags.Artists), folderAt(folders, 0), unknownArtist)
+	albumName := firstNonEmpty(tags.Album, folderAt(folders, 1), unknownAlbum)
+	artists := tags.Artists
+	if len(artists) == 0 {
+		artists = []string{artistName}
+	}
+	// Albums commonly tag only some tracks with a disc number. Treating an
+	// absent one as disc 1 keeps a mixed album in a single running order
+	// instead of interleaving the untagged tracks ahead of the rest.
+	disc := max(tags.Disc, 1)
+
+	artistID := store.StableID("artist", lib.ID, strings.ToLower(artistName))
+	albumID := store.StableID("album", artistID, strings.ToLower(albumName))
+	artist := store.Item{ID: artistID, LibraryID: lib.ID, ParentID: lib.ID, Type: "MusicArtist", Name: artistName, IsFolder: true, LastSeenScan: s.scanID}
+	if err := s.Store.UpsertItem(artist); err != nil {
+		return err
+	}
+	if len(folders) > 1 {
+		if err := s.saveFolderSidecars(artistID, filepath.Join(filepath.Clean(lib.Path), folders[0])); err != nil {
+			return err
+		}
+	}
+
+	album := store.Item{ID: albumID, LibraryID: lib.ID, ParentID: artistID, Type: "MusicAlbum", Name: albumName, IsFolder: true,
+		ProductionYear: tags.Year, Album: albumName, AlbumArtist: artistName, ArtistsJSON: store.JSON([]string{artistName}),
+		GenresJSON: genreJSON(tags.Genre), LastSeenScan: s.scanID}
+	if err := s.Store.UpsertItem(album); err != nil {
+		return err
+	}
+	// The album folder holds the cover art. Jellyfin gives a file beside the
+	// media precedence over anything embedded in the track.
+	if err := s.saveFolderSidecars(albumID, filepath.Dir(path)); err != nil {
+		return err
+	}
+
+	track := store.Item{ID: store.StableID("item", path), LibraryID: lib.ID, ParentID: albumID, Type: "Audio",
+		Name: firstNonEmpty(tags.Title, cleanName(path)), Path: path, RelativePath: rel, Container: ext, Size: size, MTimeUnix: mtime,
+		IndexNumber: tags.Track, ParentIndexNumber: disc, RuntimeTicks: tags.DurationTicks, ProductionYear: tags.Year,
+		Album: albumName, AlbumArtist: artistName, ArtistsJSON: store.JSON(artists), GenresJSON: genreJSON(tags.Genre),
+		LastSeenScan: s.scanID}
+	if err := s.Store.UpsertItem(track); err != nil {
+		return err
+	}
+	return s.saveSidecars(track.ID, path)
+}
+
+// touchTrackParents keeps the album and artist of an unchanged track in the
+// current scan. Reading the stored parents avoids re-parsing the file's tags
+// only to recompute IDs that cannot have moved.
+func (s Scanner) touchTrackParents(id string) error {
+	track, err := s.Store.Item(id)
+	if err != nil {
+		return err
+	}
+	album, err := s.Store.Item(track.ParentID)
+	if err != nil {
+		return err
+	}
+	if err := s.Store.TouchItem(album.ID, s.scanID); err != nil {
+		return err
+	}
+	return s.Store.TouchItem(album.ParentID, s.scanID)
 }
 
 func (s Scanner) touchEpisodeParents(lib store.Library, rel string) error {
@@ -344,6 +452,47 @@ func (s Scanner) saveFolderSidecars(id, dir string) error {
 
 func cleanName(path string) string {
 	return cleanPart(strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)))
+}
+
+// Names used when a track carries no tags and sits directly in the library
+// root, so there is no folder to borrow a name from either.
+const (
+	unknownArtist = "Unknown Artist"
+	unknownAlbum  = "Unknown Album"
+)
+
+// folderAt returns the folder at depth i of a path relative to the library
+// root, or "" when the file sits above that depth.
+func folderAt(parts []string, i int) string {
+	if i >= len(parts)-1 {
+		return ""
+	}
+	return cleanPart(parts[i])
+}
+
+func first(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// genreJSON encodes a single tag genre the way TMDB genre lists are stored, so
+// music and video items expose the same Genres field.
+func genreJSON(genre string) string {
+	if genre == "" {
+		return ""
+	}
+	return store.JSON([]string{genre})
 }
 
 func seriesNameFromEpisodeFile(name string) string {

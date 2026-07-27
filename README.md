@@ -2,7 +2,7 @@
 
 GoFin is a small Go media server compatible with Jellyfin clients like Plezy.
 
-Built for a simple home/LAN setup — Movies and TV shows, direct playback, SQLite, TMDB metadata.
+Built for a simple home/LAN setup — Movies, TV shows and Music, direct playback, SQLite, TMDB metadata.
 
 For build, local development, and production deployment with Podman or systemd, see [DEPLOY.md](DEPLOY.md).
 
@@ -10,6 +10,7 @@ For build, local development, and production deployment with Podman or systemd, 
 
 - **Rich metadata** — posters, backdrops, cast (up to 15), crew, genres, studios, ratings, runtime, taglines, external links (TMDB/IMDb)
 - **TV show support** — series, seasons, episodes with full metadata
+- **Music support** — artists, albums and tracks read from embedded tags, with exact durations parsed from container headers (no FFmpeg, no extra dependencies)
 - **Smart scanning** — incremental rescans (skips unchanged files by size+mtime), auto-removes deleted files, background scan loop
 - **Exact provider IDs** — `[tmdbid-438631]`, `[imdbid-tt1160419]`, `[tvdbid-12345]` in filenames for zero-guess matching
 - **People database** — cast/crew stored in SQLite with TMDB profile images, lazy-loaded biographies
@@ -20,7 +21,7 @@ For build, local development, and production deployment with Podman or systemd, 
 - **Favorites** — add/remove favorites, filter by favorites
 - **Next Up** — unwatched episode queue for TV shows
 - **Filters** — by genre, rating, year, person, name prefix, favorites, played state
-- **Jellyfin API compatibility** — endpoints for /Items, /Shows, /Persons, /Search/Hints, /Sessions, /PlaybackInfo, streaming, images, and more
+- **Jellyfin API compatibility** — endpoints for /Items, /Shows, /Artists, /MusicGenres, /Persons, /Search/Hints, /Sessions, /PlaybackInfo, streaming, images, and more
 - **No transcoding** — direct-play only, no FFmpeg required
 
 ## Configuration
@@ -29,17 +30,19 @@ For build, local development, and production deployment with Podman or systemd, 
 {
   "libraries": [
     { "name": "Movies", "type": "movies", "path": "/data/movies" },
-    { "name": "TV", "type": "tvshows", "path": "/data/tv" }
+    { "name": "TV", "type": "tvshows", "path": "/data/tv" },
+    { "name": "Music", "type": "music", "path": "/data/music" }
   ],
   "scan": {
     "on_start": false,
-    "interval_minutes": 0,
-    "workers": 4
+    "interval_minutes": 0
   }
 }
 ```
 
-Set `TMDB_API_KEY` in the environment.
+Library `type` is `movies`, `tvshows` or `music`. Paths must be absolute and unique.
+
+Set `TMDB_API_KEY` in the environment. Music needs no key — its metadata comes from the tags embedded in each file.
 
 ## Recommended naming
 
@@ -47,16 +50,29 @@ Set `TMDB_API_KEY` in the environment.
 Movies/Dune (2021).mkv
 Movies/Dune Part Two (2024) [tmdbid-438631].mkv
 TV/Example Show (2024)/Season 01/Example Show S01E01.mkv
+Music/New Order/Power (1983)/01 Blue Monday.flac
 ```
+
+## Music
+
+Tracks are read straight from each file's embedded tags, so a well-tagged library needs no network calls and no API key.
+
+- **Containers** — `flac`, `m4a`, `m4b`, `ogg`, `oga`, `opus`. All are direct-play friendly, which is the point: the server never transcodes. Audio in an MP4 container must be named `.m4a`, matching what Jellyfin expects; an `.mp4` in a music library is ignored.
+- **Tags beat folders** — artist and album come from `ALBUMARTIST`/`ALBUM` (or their MP4 equivalents), so compilations and re-tagged files group correctly even when the directory names disagree. Folder names are only a fallback for untagged files.
+- **Durations are exact**, parsed from the container header: FLAC `STREAMINFO`, Ogg granule positions, MP4 `mvhd`. No estimation, no probing.
+- **Cover art** comes from `cover.jpg`, `folder.jpg` or `poster.jpg` in the album folder — the same precedence Jellyfin applies.
+- **Multi-disc albums** use the `DISCNUMBER` tag. A track without one counts as disc 1, so a partly tagged album keeps a single running order.
+
+Clients stream from `/Audio/{id}/stream`, `/Audio/{id}/stream.{ext}` and `/Audio/{id}/universal`. All three return the original bytes with range support, so seeking works.
 
 ## User types
 
 ```sh
 # Admin (full access)
-./gofin user add --name admin --password pass --admin
+printf '%s' 'choose-a-strong-password' | ./gofin user add --name admin --password-stdin --admin
 
 # Child (content filtered by rating)
-./gofin user add --name kid --password pass --child --max-rating 3
+printf '%s' 'choose-a-strong-password' | ./gofin user add --name kid --password-stdin --child --max-rating 3
 ```
 
 Rating levels: G=1, PG=2, PG-13/TV-14=3, R/TV-MA=4, NC-17=5.
@@ -67,9 +83,16 @@ GoFin is not a full Jellyfin replacement. It intentionally omits:
 
 - **Transcoding**
 - **FFmpeg probing** (no codec/stream analysis yet)
-- **Music libraries**
 - **Plugin system**
 - **Multiple metadata providers** (TMDB only)
 - **Fuzzy metadata matching**
 
-The goal is a small, fast, reliable direct-play server for movie and TV libraries.
+For music specifically, it also omits:
+
+- **Online music metadata** — no MusicBrainz or Last.fm, tags only
+- **Playlists, Instant Mix and lyrics**
+- **Embedded cover art extraction** — external image files only
+
+Because nothing is transcoded, a client that cannot decode a container simply will not play it. FLAC and M4A play essentially everywhere; Opus depends on the client.
+
+The goal is a small, fast, reliable direct-play server for movie, TV and music libraries.
