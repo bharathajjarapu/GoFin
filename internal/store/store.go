@@ -173,16 +173,20 @@ func (s *Store) SaveLibraries(libs []Library) error {
 		return err
 	}
 	defer tx.Rollback()
+	// The playlists folder is never configured and never scanned, so it must
+	// survive this sweep. Dropping it would cascade every playlist away on the
+	// next restart.
 	if len(libs) == 0 {
-		if _, err := tx.Exec(`DELETE FROM libraries`); err != nil {
+		if _, err := tx.Exec(`DELETE FROM libraries WHERE collection_type<>?`, PlaylistCollection); err != nil {
 			return err
 		}
 	} else {
-		args := make([]any, len(libs))
-		for i, l := range libs {
-			args[i] = l.ID
+		args := make([]any, 0, len(libs)+1)
+		for _, l := range libs {
+			args = append(args, l.ID)
 		}
-		if _, err := tx.Exec(`DELETE FROM libraries WHERE id NOT IN (`+strings.TrimRight(strings.Repeat("?,", len(libs)), ",")+`)`, args...); err != nil {
+		args = append(args, PlaylistCollection)
+		if _, err := tx.Exec(`DELETE FROM libraries WHERE id NOT IN (`+strings.TrimRight(strings.Repeat("?,", len(libs)), ",")+`) AND collection_type<>?`, args...); err != nil {
 			return err
 		}
 	}
@@ -1184,6 +1188,8 @@ CREATE TABLE IF NOT EXISTS media_sources (id TEXT PRIMARY KEY, item_id TEXT NOT 
 CREATE TABLE IF NOT EXISTS images (id TEXT PRIMARY KEY, item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, image_type TEXT NOT NULL, image_index INTEGER NOT NULL DEFAULT 0, path TEXT NOT NULL, tag TEXT NOT NULL, width INTEGER, height INTEGER, mime_type TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(item_id, image_type, image_index));
 CREATE TABLE IF NOT EXISTS people (id TEXT PRIMARY KEY, tmdb_id INTEGER UNIQUE, imdb_id TEXT, name TEXT NOT NULL, profile_url TEXT, biography TEXT, birth_date TEXT, death_date TEXT, place_of_birth TEXT, known_for_department TEXT, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS item_people (item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE, role TEXT NOT NULL, character TEXT NOT NULL DEFAULT '', sort_order INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(item_id, person_id, role, character));
+CREATE TABLE IF NOT EXISTS playlist_entries (entry_id TEXT PRIMARY KEY, playlist_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, item_id TEXT NOT NULL, position INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_playlist_entries ON playlist_entries(playlist_id, position);
 CREATE TABLE IF NOT EXISTS playback_state (user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, item_id TEXT NOT NULL, played INTEGER NOT NULL DEFAULT 0, play_count INTEGER NOT NULL DEFAULT 0, playback_position_ticks INTEGER NOT NULL DEFAULT 0, is_favorite INTEGER NOT NULL DEFAULT 0, likes INTEGER, last_played_at TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(user_id, item_id));
 CREATE INDEX IF NOT EXISTS idx_items_library_parent ON items(library_id, parent_id);
 CREATE INDEX IF NOT EXISTS idx_items_parent_id ON items(parent_id);

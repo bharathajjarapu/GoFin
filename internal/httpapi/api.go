@@ -114,6 +114,8 @@ func (a API) Handler() http.Handler {
 	m.HandleFunc("/Persons/", a.persons)
 	m.HandleFunc("/Artists", a.artists)
 	m.HandleFunc("/Artists/", a.artists)
+	m.HandleFunc("/Playlists", a.playlists)
+	m.HandleFunc("/Playlists/", a.playlists)
 	m.HandleFunc("/MusicGenres", a.musicGenres)
 	m.HandleFunc("/MusicGenres/", a.musicGenres)
 	m.HandleFunc("/Videos/", a.stream)
@@ -290,16 +292,34 @@ func (a API) itemDTOs(items []store.Item, userID string) []map[string]any {
 	playback, _ := a.S.PlaybackByItemIDs(userID, ids)
 	parents := a.episodeParents(items)
 	stats, _ := a.S.FolderStats(folderIDs(items))
+	playlistCounts, _ := a.S.PlaylistCounts(typeIDs(items, "Playlist"))
 	albumTags := a.albumImageTags(items)
 	out := make([]map[string]any, 0, len(items))
 	for _, it := range items {
+		stat := stats[it.ID]
+		// A playlist's members hang off a side table, not parent_id, so the
+		// folder statistics query cannot see them.
+		if n, ok := playlistCounts[it.ID]; ok {
+			stat.ChildCount, stat.RecursiveItemCount = n, n
+		}
 		out = append(out, a.itemDTOWith(it, itemExtras{
 			images:   imgs[it.ID],
 			playback: playback[it.ID],
 			parent:   parents[it.ID],
-			stat:     stats[it.ID],
+			stat:     stat,
 			albumTag: albumTags[it.ParentID],
 		}))
+	}
+	return out
+}
+
+// typeIDs picks out the ids of the items of one type on a page.
+func typeIDs(items []store.Item, typ string) []string {
+	var out []string
+	for _, it := range items {
+		if it.Type == typ {
+			out = append(out, it.ID)
+		}
 	}
 	return out
 }
@@ -437,6 +457,16 @@ func (a API) item(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+	}
+	if r.Method == http.MethodDelete {
+		// Only playlists are deletable: media leaves the library by leaving
+		// the disk, and DeletePlaylist refuses anything of another type.
+		if err := a.S.DeletePlaylist(id); err != nil {
+			fail(w, err, http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
 	}
 	if r.Method == http.MethodPost {
 		w.WriteHeader(http.StatusNoContent)
@@ -1399,7 +1429,7 @@ func sessionDTO(s store.Session) map[string]any {
 // jfType maps a configured library type to the Jellyfin collection name.
 func jfType(t string) string {
 	switch t {
-	case "tvshows", "music":
+	case "tvshows", "music", store.PlaylistCollection:
 		return t
 	}
 	return "movies"

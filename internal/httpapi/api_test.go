@@ -813,3 +813,61 @@ func TestAudioLyrics(t *testing.T) {
 	must(t, os.WriteFile(filepath.Join(dir, "01.flac"), []byte("fLaC"), 0600))
 	status(t, h, http.MethodGet, "/Audio/track/Lyrics", head, nil, http.StatusNotFound)
 }
+
+func TestPlaylists(t *testing.T) {
+	s, dir := musicStore(t)
+	defer s.Close()
+	track := filepath.Join(dir, "01.flac")
+	must(t, s.UpsertItem(store.Item{ID: "track2", LibraryID: "lib", ParentID: "album", Type: "Audio", Name: "The Beach", Path: track, Container: "flac"}))
+	must(t, s.UpsertItem(store.Item{ID: "adult", LibraryID: "lib", ParentID: "album", Type: "Audio", Name: "Explicit", Path: track, Container: "flac", OfficialRating: "R"}))
+	h := API{C: config.Config{Server: config.Server{ID: "server-1"}}, S: s}.Handler()
+	head := login(t, h)
+
+	created := post(t, h, "/Playlists", head, []byte(`{"Name":"Mix","Ids":["track","track2","adult"]}`), http.StatusOK)
+	id := created["Id"].(string)
+
+	listed := get(t, h, "/Playlists/"+id+"/Items", head, http.StatusOK)
+	if count(listed) != 3 || firstID(listed) != "track" {
+		t.Fatalf("playlist items = %#v", listed)
+	}
+	entryID := listed["Items"].([]any)[0].(map[string]any)["PlaylistItemId"].(string)
+
+	// A playlist is an ordinary item, so it browses like one.
+	browsed := get(t, h, "/Items?IncludeItemTypes=Playlist", head, http.StatusOK)
+	if count(browsed) != 1 || browsed["Items"].([]any)[0].(map[string]any)["ChildCount"].(float64) != 3 {
+		t.Fatalf("playlist in browse = %#v", browsed)
+	}
+
+	// Moving the first entry to the end reorders the listing.
+	status(t, h, http.MethodPost, "/Playlists/"+id+"/Items/"+entryID+"/Move/2", head, nil, http.StatusNoContent)
+	if moved := get(t, h, "/Playlists/"+id+"/Items", head, http.StatusOK); firstID(moved) != "track2" {
+		t.Fatalf("move did not reorder: %#v", moved)
+	}
+
+	status(t, h, http.MethodDelete, "/Playlists/"+id+"/Items?EntryIds="+entryID, head, nil, http.StatusNoContent)
+	if after := get(t, h, "/Playlists/"+id+"/Items", head, http.StatusOK); count(after) != 2 {
+		t.Fatalf("remove left %d entries", count(after))
+	}
+
+	// A shared playlist must still hide what a child account may not see.
+	must(t, s.AddUserPolicy("kid", "pass", false, true, 2))
+	kidAuth := post(t, h, "/Users/AuthenticateByName", nil, []byte(`{"Username":"kid","Pw":"pass"}`), http.StatusOK)
+	kid := map[string]string{"X-Emby-Token": kidAuth["AccessToken"].(string)}
+	kidView := get(t, h, "/Playlists/"+id+"/Items", kid, http.StatusOK)
+	for _, item := range kidView["Items"].([]any) {
+		if item.(map[string]any)["Id"] == "adult" {
+			t.Fatalf("child account saw restricted track: %#v", kidView)
+		}
+	}
+
+	// Rewriting the configured libraries must not take playlists with it.
+	must(t, s.SaveLibraries([]store.Library{{ID: "lib", Name: "Music", Type: "music", Path: dir}}))
+	if _, err := s.Item(id); err != nil {
+		t.Fatalf("library sweep destroyed the playlist: %v", err)
+	}
+
+	status(t, h, http.MethodDelete, "/Items/"+id, head, nil, http.StatusNoContent)
+	status(t, h, http.MethodGet, "/Playlists/"+id+"/Items", head, nil, http.StatusNotFound)
+	// Media is not deletable through the same route.
+	status(t, h, http.MethodDelete, "/Items/track", head, nil, http.StatusNotFound)
+}
