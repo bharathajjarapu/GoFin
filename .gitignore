@@ -5,3 +5,6 @@ gofin
 gofin.json
 gofin.db
 *.db
+.agents
+.claude
+skills-lock.json

@@ -2,6 +2,7 @@
 Description=GoFin container
 After=network-online.target
 Wants=network-online.target
+RequiresMountsFor=/srv/media
 
 [Container]
 Image=localhost/gofin:local

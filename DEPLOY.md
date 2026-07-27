@@ -6,7 +6,7 @@ For a small home server, direct systemd is the fewest moving parts. Podman is cl
 
 ## Build and run
 
-This project requires Go 1.22 or newer. On Debian/Ubuntu, install the distribution package and confirm that it meets that requirement:
+This project requires Go 1.26 or newer. On Debian/Ubuntu, install the distribution package and confirm that it meets that requirement:
 
 ```sh
 sudo apt update
@@ -14,12 +14,13 @@ sudo apt install -y golang-go
 go version
 ```
 
-If `go version` is older than 1.22, install the official Go 1.22 archive instead (use the matching archive for your CPU architecture):
+If `go version` is older than 1.26, install the official Go 1.26 archive instead (use the matching archive for your CPU architecture):
 
 ```sh
-wget https://go.dev/dl/go1.22.12.linux-amd64.tar.gz
+GO_ARCHIVE=go1.26.5.linux-amd64.tar.gz
+wget "https://go.dev/dl/$GO_ARCHIVE"
 sudo rm -rf /usr/local/go
-sudo tar -C /usr/local -xzf go1.22.12.linux-amd64.tar.gz
+sudo tar -C /usr/local -xzf "$GO_ARCHIVE"
 echo 'export PATH=/usr/local/go/bin:$PATH' >> ~/.profile
 . ~/.profile
 go version
@@ -164,10 +165,10 @@ sudo chown -R gofin:gofin /srv/gofin
 Create the first GoFin administrator with the installed binary. This is the account that signs in from a Jellyfin-compatible client; it is separate from the Linux `gofin` service account.
 
 ```sh
-sudo -u gofin /usr/local/bin/gofin user add \
+printf '%s' 'choose-a-strong-password' | sudo -u gofin /usr/local/bin/gofin user add \
   --config /srv/gofin/gofin.json \
   --name admin \
-  --password 'choose-a-strong-password'
+  --password-stdin
 ```
 
 Make sure the `gofin` user can read your media folders. Then install and start the service. It will scan the configured Movies and TV Shows paths on startup when `"on_start": true` is set in the config:
@@ -190,8 +191,29 @@ systemctl status gofin.service
 - Tags matching `v*` trigger GitHub Actions to publish static `linux/amd64` and `linux/arm64` binaries, plus a multi-architecture image to GitHub Container Registry.
 - The container image has no Go compiler, shell, package manager, or Alpine runtime. It includes the static binary and CA certificates needed for TMDB HTTPS requests.
 - Keep `TMDB_API_KEY` in `/srv/gofin/gofin.env`, not in the config file.
+- For internet exposure, place GoFin behind a TLS reverse proxy. The server is intended for authenticated LAN use. See [Rate limiting](#rate-limiting) before you do.
 - Keep the database on local storage. Media can live on a mounted disk.
+- If your media mount is not `/srv/media`, update `RequiresMountsFor=` in the installed unit to match it.
 - Back up `/srv/gofin/gofin.db`.
 - Use direct play friendly files (`mkv`, `mp4`, `m4v`, `avi`, `mov`, `webm`).
 - External links are already populated from TMDB/IMDb metadata when available.
+
+## Rate limiting
+
+`POST /Users/AuthenticateByName` allows **10 attempts per client IP per minute**. Attempts beyond that get `429 Too Many Requests` with a `Retry-After` header holding the seconds left in the window. The counter resets a minute after the first attempt in the window, so a locked-out client recovers on its own. Successful and failed logins both count.
+
+The limiter tracks at most 1024 client IPs at a time. Once full it drops entries older than a minute; if every entry is still live it rejects new logins rather than growing without bound.
+
+Only the login endpoint is limited. Every other endpoint requires a token, so it is already closed to anonymous callers.
+
+**Behind a reverse proxy this limiter stops working as intended.** It keys on the connection's remote address, and it does not read `X-Forwarded-For`, so every request appears to come from the proxy. All clients then share one 10-per-minute bucket and a single attacker locks out the whole household. If you terminate TLS at a proxy, rate limit the login endpoint there instead, keyed on the real client IP:
+
+```nginx
+limit_req_zone $binary_remote_addr zone=gofin_login:10m rate=10r/m;
+
+location /Users/AuthenticateByName {
+    limit_req zone=gofin_login burst=5 nodelay;
+    proxy_pass http://127.0.0.1:8096;
+}
+```
 - Transcoding is intentionally not included. Adding it means FFmpeg, media probing, larger images, more CPU, and more Jellyfin API behavior.
