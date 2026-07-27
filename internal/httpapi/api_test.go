@@ -611,6 +611,10 @@ func TestMusicBrowseAndStream(t *testing.T) {
 	if album["AlbumArtist"] != "New Order" || album["Album"] != "Power" || album["MediaType"] != "Unknown" {
 		t.Fatalf("album dto = %#v", album)
 	}
+	// Cover art is square; the poster ratio would letterbox it.
+	if album["PrimaryImageAspectRatio"].(float64) != 1 {
+		t.Fatalf("album aspect ratio = %v, want 1", album["PrimaryImageAspectRatio"])
+	}
 
 	tracks := get(t, h, "/Items?ParentId=album&IncludeItemTypes=Audio", head, http.StatusOK)
 	track := tracks["Items"].([]any)[0].(map[string]any)
@@ -667,4 +671,45 @@ func TestAudioStreamRoutes(t *testing.T) {
 	status(t, h, http.MethodGet, "/Audio/track/stream", nil, nil, http.StatusUnauthorized)
 	// A folder has no bytes to serve even though the item exists.
 	status(t, h, http.MethodGet, "/Audio/album/stream", head, nil, http.StatusNotFound)
+}
+
+// A limited listing must still report how many items match. Reporting the page
+// size instead stops a client's paging after the first page.
+func TestPagingTotalsAndDownload(t *testing.T) {
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "gofin.db"))
+	must(t, err)
+	defer s.Close()
+	must(t, s.SaveLibraries([]store.Library{{ID: "lib", Name: "Movies", Type: "movies", Path: dir}}))
+	must(t, s.AddUserPolicy("admin", "pass", true, false, 0))
+	file := filepath.Join(dir, "Alpha.mkv")
+	must(t, os.WriteFile(file, []byte("movie-bytes"), 0600))
+	for id, name := range map[string]string{"m1": "Alpha", "m2": "Beta", "m3": "Gamma"} {
+		must(t, s.UpsertItem(store.Item{ID: id, LibraryID: "lib", ParentID: "lib", Type: "Movie", Name: name, Path: file, Container: "mkv"}))
+	}
+	h := API{C: config.Config{Server: config.Server{ID: "server-1"}}, S: s}.Handler()
+	head := login(t, h)
+
+	limited := get(t, h, "/Items?IncludeItemTypes=Movie&Limit=1", head, http.StatusOK)
+	if count(limited) != 1 || limited["TotalRecordCount"].(float64) != 3 {
+		t.Fatalf("limited page = %d items, total %v; want 1 of 3", count(limited), limited["TotalRecordCount"])
+	}
+	// SQLite rejects OFFSET without LIMIT, so this used to fail with a 500.
+	offset := get(t, h, "/Items?IncludeItemTypes=Movie&StartIndex=1", head, http.StatusOK)
+	if count(offset) != 2 || offset["TotalRecordCount"].(float64) != 3 {
+		t.Fatalf("offset page = %d items, total %v; want 2 of 3", count(offset), offset["TotalRecordCount"])
+	}
+
+	// Download must return the file itself. It used to fall through and return
+	// the item DTO, so clients saved a JSON blob named after the movie.
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/Items/m1/Download", nil)
+	req.Header.Set("X-Emby-Token", head["X-Emby-Token"])
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || w.Body.String() != "movie-bytes" {
+		t.Fatalf("download = %d %q", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Header().Get("Content-Disposition"), "attachment") {
+		t.Fatalf("download must be an attachment: %q", w.Header().Get("Content-Disposition"))
+	}
 }

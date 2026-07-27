@@ -223,22 +223,40 @@ func (a API) userViews(w http.ResponseWriter, r *http.Request) {
 	for _, l := range libs {
 		items = append(items, map[string]any{"Id": l.ID, "Name": l.Name, "ServerId": a.C.Server.ID, "Type": "CollectionFolder", "IsFolder": true, "CollectionType": jfType(l.Type), "ImageTags": map[string]string{}})
 	}
-	write(w, page(items))
+	write(w, page(items, len(items)))
 }
 
 func (a API) items(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	u, _ := a.userNoFail(r)
-	items, err := a.S.Items(store.ItemQuery{ParentID: q.Get("ParentId"), Type: q.Get("IncludeItemTypes"), Search: q.Get("SearchTerm"), SortBy: q.Get("SortBy"), SortOrder: q.Get("SortOrder"), PersonIDs: q.Get("PersonIds"), Genres: q.Get("Genres"), OfficialRatings: q.Get("OfficialRatings"), Years: q.Get("Years"), NameStartsWith: q.Get("NameStartsWith"), UserID: u.ID, Favorite: userFilter(q, "IsFavorite"), Played: userFilter(q, "IsPlayed"), Unplayed: userFilter(q, "IsUnplayed"), Recursive: parseBool(q.Get("Recursive")), Start: atoi(q.Get("StartIndex")), Limit: queryLimit(q.Get("Limit"))})
+	query := store.ItemQuery{ParentID: q.Get("ParentId"), Type: q.Get("IncludeItemTypes"), Search: q.Get("SearchTerm"), SortBy: q.Get("SortBy"), SortOrder: q.Get("SortOrder"), PersonIDs: q.Get("PersonIds"), Genres: q.Get("Genres"), OfficialRatings: q.Get("OfficialRatings"), Years: q.Get("Years"), NameStartsWith: q.Get("NameStartsWith"), UserID: u.ID, Favorite: userFilter(q, "IsFavorite"), Played: userFilter(q, "IsPlayed"), Unplayed: userFilter(q, "IsUnplayed"), Recursive: parseBool(q.Get("Recursive")), Start: atoi(q.Get("StartIndex")), Limit: queryLimit(q.Get("Limit"))}
+	items, err := a.S.Items(query)
 	if err != nil {
 		fail(w, err, 500)
 		return
 	}
-	items = a.allowedItems(u, items)
-	write(w, page(a.itemDTOs(items, u.ID)))
+	write(w, page(a.itemDTOs(a.allowedItems(u, items), u.ID), a.total(u, query, items)))
+}
+
+// total reports how many items a listing has before paging. Parental filtering
+// happens in Go rather than in SQL, so a restricted user gets the unfiltered
+// count; overshooting only costs a client one short final page, while reporting
+// the page size would stop it after the first page.
+func (a API) total(u store.User, q store.ItemQuery, items []store.Item) int {
+	if q.Limit <= 0 && q.Start == 0 {
+		return len(a.allowedItems(u, items))
+	}
+	n, err := a.S.CountItems(q)
+	if err != nil {
+		return len(items)
+	}
+	return n
 }
 
 func (a API) allowedItems(u store.User, items []store.Item) []store.Item {
+	if unrestricted(u) {
+		return items
+	}
 	out := make([]store.Item, 0, len(items))
 	for _, it := range items {
 		if a.allowed(u, it) {
@@ -347,8 +365,13 @@ func (a API) item(w http.ResponseWriter, r *http.Request) {
 		case "Images":
 			a.images(w, r, id, parts[2:])
 			return
+		case "Download":
+			// The path is /Items/{id}/Download, which is the same shape stream
+			// already parses for /Videos and /Audio.
+			a.stream(w, r)
+			return
 		case "Similar", "LocalTrailers", "SpecialFeatures":
-			write(w, page([]map[string]any{}))
+			write(w, page([]map[string]any{}, 0))
 			return
 		case "Refresh":
 			w.WriteHeader(http.StatusNoContent)
@@ -511,7 +534,7 @@ func (a API) resume(w http.ResponseWriter, r *http.Request) {
 		fail(w, err, 500)
 		return
 	}
-	write(w, page(a.itemDTOs(a.allowedItems(u, items), u.ID)))
+	write(w, page(a.itemDTOs(a.allowedItems(u, items), u.ID), len(items)))
 }
 
 func (a API) shows(w http.ResponseWriter, r *http.Request) {
@@ -529,8 +552,9 @@ func (a API) shows(w http.ResponseWriter, r *http.Request) {
 			fail(w, err, http.StatusInternalServerError)
 			return
 		}
+		total := len(a.allowedItems(u, items))
 		items = pagedItems(items, atoi(urlq.Get("StartIndex")), queryLimit(urlq.Get("Limit")))
-		write(w, page(a.itemDTOs(a.allowedItems(u, items), u.ID)))
+		write(w, page(a.itemDTOs(a.allowedItems(u, items), u.ID), total))
 		return
 	}
 	q := store.ItemQuery{ParentID: parts[0], Start: atoi(urlq.Get("StartIndex")), Limit: queryLimit(urlq.Get("Limit")), SortBy: "IndexNumber"}
@@ -546,7 +570,7 @@ func (a API) shows(w http.ResponseWriter, r *http.Request) {
 		fail(w, err, 500)
 		return
 	}
-	write(w, page(a.itemDTOs(a.allowedItems(u, items), u.ID)))
+	write(w, page(a.itemDTOs(a.allowedItems(u, items), u.ID), a.total(u, q, items)))
 }
 
 func pagedItems(items []store.Item, start, limit int) []store.Item {
@@ -570,16 +594,15 @@ func (a API) nextUp(w http.ResponseWriter, r *http.Request) {
 		fail(w, err, 500)
 		return
 	}
-	write(w, page(a.itemDTOs(a.allowedItems(u, items), u.ID)))
+	write(w, page(a.itemDTOs(a.allowedItems(u, items), u.ID), len(items)))
 }
 func (a API) counts(w http.ResponseWriter, r *http.Request) {
 	u, _ := a.userNoFail(r)
 	counts := map[string]string{"MovieCount": "Movie", "SeriesCount": "Series", "EpisodeCount": "Episode",
 		"SongCount": "Audio", "AlbumCount": "MusicAlbum", "ArtistCount": "MusicArtist"}
 	out := map[string]int{}
-	unrestricted := u.ID == "" || u.IsAdmin || !u.IsChild || u.MaxParentalRating == 0
 	for field, typ := range counts {
-		if unrestricted {
+		if unrestricted(u) {
 			out[field], _ = a.S.CountItemsByType(typ)
 			continue
 		}
@@ -638,7 +661,7 @@ func (a API) mediaSegments(w http.ResponseWriter, r *http.Request) {
 	write(w, map[string]any{"Items": []any{}, "TotalRecordCount": 0})
 }
 
-func (a API) emptyPage(w http.ResponseWriter, r *http.Request) { write(w, page([]map[string]any{})) }
+func (a API) emptyPage(w http.ResponseWriter, r *http.Request) { write(w, page([]map[string]any{}, 0)) }
 
 func (a API) favorite(w http.ResponseWriter, r *http.Request) {
 	u, ok := a.user(w, r)
@@ -831,6 +854,9 @@ func (a API) stream(w http.ResponseWriter, r *http.Request) {
 	if ct := contentTypes[it.Container]; ct != "" {
 		w.Header().Set("Content-Type", ct)
 	}
+	if strings.HasSuffix(r.URL.Path, "/Download") {
+		w.Header().Set("Content-Disposition", "attachment; filename="+strconv.Quote(filepath.Base(it.Path)))
+	}
 	http.ServeFile(w, r, it.Path)
 }
 
@@ -855,8 +881,8 @@ func (a API) artists(w http.ResponseWriter, r *http.Request) {
 		fail(w, err, http.StatusInternalServerError)
 		return
 	}
-	items = a.allowedItems(u, items)
 	if name != "" && name != "AlbumArtists" {
+		items = a.allowedItems(u, items)
 		if len(items) == 0 {
 			http.NotFound(w, r)
 			return
@@ -864,7 +890,7 @@ func (a API) artists(w http.ResponseWriter, r *http.Request) {
 		write(w, a.itemDTO(items[0], u.ID))
 		return
 	}
-	write(w, page(a.itemDTOs(items, u.ID)))
+	write(w, page(a.itemDTOs(a.allowedItems(u, items), u.ID), a.total(u, query, items)))
 }
 
 // musicGenres lists the genres present on music items, which clients offer as
@@ -881,7 +907,7 @@ func (a API) musicGenres(w http.ResponseWriter, r *http.Request) {
 	for _, g := range genres {
 		out = append(out, map[string]any{"Name": g, "Id": store.StableID("name", g), "Type": "MusicGenre", "ServerId": a.C.Server.ID})
 	}
-	write(w, page(out))
+	write(w, page(out, len(out)))
 }
 
 func (a API) persons(w http.ResponseWriter, r *http.Request) {
@@ -942,7 +968,7 @@ func (a API) personsList(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, a.personDTO(p, false))
 	}
-	write(w, page(out))
+	write(w, page(out, len(out)))
 }
 
 func (a API) person(name string) (store.Person, error) {
@@ -1028,7 +1054,7 @@ func (a API) itemDTOWith(it store.Item, imgs []store.Image, p store.Playback, pa
 	}
 	genres := stringsJSON(it.GenresJSON)
 	ud := userData(p, it.ID)
-	m := map[string]any{"Id": it.ID, "Name": it.Name, "ServerId": a.C.Server.ID, "Type": it.Type, "IsFolder": it.IsFolder, "ParentId": it.ParentID, "SortName": it.SortName, "DateCreated": it.DateCreated, "MediaType": mediaType(it), "ImageTags": imageTags, "BackdropImageTags": backdrops, "Overview": it.Overview, "ProductionYear": zeroNil(it.ProductionYear), "PremiereDate": emptyNil(it.PremiereDate), "IndexNumber": zeroNil(it.IndexNumber), "ParentIndexNumber": zeroNil(it.ParentIndexNumber), "ProviderIds": providerIDs(it.ProviderIDsJSON), "Genres": genres, "GenreItems": namedItems(genres), "Studios": namedItems(stringsJSON(it.StudiosJSON)), "People": people(it.PeopleJSON), "CommunityRating": zeroNilFloat(it.CommunityRating), "OfficialRating": emptyNil(it.OfficialRating), "RunTimeTicks": zeroNil64(it.RuntimeTicks), "Taglines": stringsJSON(it.TaglinesJSON), "ExternalUrls": externalURLs(it.ExternalURLsJSON), "MediaSourceCount": mediaSourceCount(it), "CanDownload": !it.IsFolder, "Container": emptyNil(it.Container), "Path": emptyNil(it.Path), "PrimaryImageAspectRatio": 0.6666666666666666, "UserData": ud}
+	m := map[string]any{"Id": it.ID, "Name": it.Name, "ServerId": a.C.Server.ID, "Type": it.Type, "IsFolder": it.IsFolder, "ParentId": it.ParentID, "SortName": it.SortName, "DateCreated": it.DateCreated, "MediaType": mediaType(it), "ImageTags": imageTags, "BackdropImageTags": backdrops, "Overview": it.Overview, "ProductionYear": zeroNil(it.ProductionYear), "PremiereDate": emptyNil(it.PremiereDate), "IndexNumber": zeroNil(it.IndexNumber), "ParentIndexNumber": zeroNil(it.ParentIndexNumber), "ProviderIds": providerIDs(it.ProviderIDsJSON), "Genres": genres, "GenreItems": namedItems(genres), "Studios": namedItems(stringsJSON(it.StudiosJSON)), "People": people(it.PeopleJSON), "CommunityRating": zeroNilFloat(it.CommunityRating), "OfficialRating": emptyNil(it.OfficialRating), "RunTimeTicks": zeroNil64(it.RuntimeTicks), "Taglines": stringsJSON(it.TaglinesJSON), "ExternalUrls": externalURLs(it.ExternalURLsJSON), "MediaSourceCount": mediaSourceCount(it), "CanDownload": !it.IsFolder, "Container": emptyNil(it.Container), "Path": emptyNil(it.Path), "PrimaryImageAspectRatio": primaryAspectRatio(it), "UserData": ud}
 	if it.Type == "Episode" {
 		if parent != nil {
 			addEpisodeParentImageFields(m, parent.season, parent.series, parent.images)
@@ -1047,6 +1073,23 @@ func (a API) itemDTOWith(it store.Item, imgs []store.Image, p store.Playback, pa
 		m["MediaStreams"] = []any{}
 	}
 	return m
+}
+
+// posterAspectRatio is the 2:3 shape of a film poster, which is what a client
+// falls back to for anything it has no better ratio for.
+const posterAspectRatio = 2.0 / 3.0
+
+// primaryAspectRatio tells a client what shape to reserve for a card before its
+// image arrives. Cover art is square and episode stills are widescreen, so
+// giving either of them the poster ratio letterboxes the image.
+func primaryAspectRatio(it store.Item) float64 {
+	switch it.Type {
+	case "Audio", "MusicAlbum", "MusicArtist":
+		return 1
+	case "Episode":
+		return 16.0 / 9.0
+	}
+	return posterAspectRatio
 }
 
 // mediaType tells a client how to play an item, which decides whether it opens
@@ -1183,8 +1226,11 @@ func authPart(r *http.Request, key string) string {
 	return ""
 }
 
-func page(items []map[string]any) map[string]any {
-	return map[string]any{"Items": items, "TotalRecordCount": len(items)}
+// page wraps a listing. The total is the number of matches before paging, which
+// is how a client knows another page exists; passing len(items) is only correct
+// for a listing that was never limited.
+func page(items []map[string]any, total int) map[string]any {
+	return map[string]any{"Items": items, "TotalRecordCount": total}
 }
 func userDTO(u store.User, serverID string) map[string]any {
 	return map[string]any{"Id": u.ID, "Name": u.Name, "ServerId": serverID, "HasPassword": true, "HasConfiguredPassword": true, "Policy": map[string]any{"IsAdministrator": u.IsAdmin, "IsDisabled": false, "IsHidden": false, "MaxParentalRating": zeroNil(u.MaxParentalRating)}}
@@ -1255,8 +1301,15 @@ func mustUser(r *http.Request) store.User {
 	return u
 }
 func parseBool(s string) bool { return strings.EqualFold(s, "true") }
+
+// unrestricted reports whether a user sees the library unfiltered. Parental
+// limits apply only to a child account that carries a maximum rating.
+func unrestricted(u store.User) bool {
+	return u.ID == "" || u.IsAdmin || !u.IsChild || u.MaxParentalRating == 0
+}
+
 func (a API) allowed(u store.User, it store.Item) bool {
-	if u.ID == "" || u.IsAdmin || !u.IsChild || u.MaxParentalRating == 0 {
+	if unrestricted(u) {
 		return true
 	}
 	score := ratingScore(it.OfficialRating)
@@ -1266,7 +1319,7 @@ func userFilter(q url.Values, name string) bool {
 	return strings.EqualFold(q.Get(name), "true") || strings.Contains(q.Get("Filters"), name)
 }
 func (a API) personAllowed(u store.User, personID string) bool {
-	if u.ID == "" || u.IsAdmin || !u.IsChild || u.MaxParentalRating == 0 {
+	if unrestricted(u) {
 		return true
 	}
 	items, _ := a.S.Items(store.ItemQuery{PersonIDs: personID, Type: "Movie,Series,Episode"})

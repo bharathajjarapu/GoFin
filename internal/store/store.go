@@ -374,9 +374,13 @@ func (s *Store) People(q PersonQuery) ([]Person, error) {
 		}
 	}
 	sqlq += ` GROUP BY p.id ORDER BY p.name COLLATE NOCASE`
-	if q.Limit > 0 {
+	switch {
+	case q.Limit > 0:
 		sqlq += ` LIMIT ?`
 		args = append(args, q.Limit)
+	case q.Start > 0:
+		// SQLite rejects OFFSET on its own, and -1 is its "no limit" limit.
+		sqlq += ` LIMIT -1`
 	}
 	if q.Start > 0 {
 		sqlq += ` OFFSET ?`
@@ -477,8 +481,11 @@ func (s *Store) ItemsByIDs(ids []string) (map[string]Item, error) {
 	return out, nil
 }
 
-func (s *Store) Items(q ItemQuery) ([]Item, error) {
-	sqlq := selectItem + ` WHERE 1=1`
+// itemFilter builds the WHERE fragment shared by Items and CountItems so that a
+// listing and its reported total can never drift apart. It returns a fragment
+// meant to follow "WHERE 1=1", which keeps every clause below uniform.
+func itemFilter(q ItemQuery) (string, []any) {
+	sqlq := ""
 	var args []any
 	if q.ParentID != "" {
 		if q.Recursive {
@@ -554,10 +561,19 @@ func (s *Store) Items(q ItemQuery) ([]Item, error) {
 			args = append(args, q.UserID)
 		}
 	}
-	sqlq += orderBy(q.SortBy, q.SortOrder)
-	if q.Limit > 0 {
+	return sqlq, args
+}
+
+func (s *Store) Items(q ItemQuery) ([]Item, error) {
+	where, args := itemFilter(q)
+	sqlq := selectItem + ` WHERE 1=1` + where + orderBy(q.SortBy, q.SortOrder)
+	switch {
+	case q.Limit > 0:
 		sqlq += ` LIMIT ?`
 		args = append(args, q.Limit)
+	case q.Start > 0:
+		// SQLite rejects OFFSET on its own, and -1 is its "no limit" limit.
+		sqlq += ` LIMIT -1`
 	}
 	if q.Start > 0 {
 		sqlq += ` OFFSET ?`
@@ -569,6 +585,16 @@ func (s *Store) Items(q ItemQuery) ([]Item, error) {
 	}
 	defer rows.Close()
 	return scanItems(rows)
+}
+
+// CountItems reports how many items match q, ignoring its paging. Clients read
+// the unpaged total to decide whether another page exists, so a count that
+// stopped at the limit would end their scrolling after the first page.
+func (s *Store) CountItems(q ItemQuery) (int, error) {
+	where, args := itemFilter(q)
+	var n int
+	err := s.DB.QueryRow(`SELECT COUNT(*) FROM items i WHERE 1=1`+where, args...).Scan(&n)
+	return n, err
 }
 
 func (s *Store) EpisodesForSeries(seriesID string) ([]Item, error) {
