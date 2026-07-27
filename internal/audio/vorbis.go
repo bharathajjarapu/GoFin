@@ -1,6 +1,7 @@
 package audio
 
 import (
+	"bytes"
 	"encoding/binary"
 	"strings"
 )
@@ -8,11 +9,11 @@ import (
 // maxComments bounds the comment list of an untrusted file.
 const maxComments = 512
 
-// parseVorbisComments reads the comment payload shared by FLAC, Ogg Vorbis and
+// eachVorbisComment walks the comment payload shared by FLAC, Ogg Vorbis and
 // Opus: a vendor string followed by a list of "KEY=value" entries, every field
-// length-prefixed little-endian. Malformed input stops the walk and keeps the
-// tags gathered so far.
-func parseVorbisComments(b []byte, t *Tags) {
+// length-prefixed little-endian. Malformed or truncated input stops the walk,
+// keeping whatever was gathered so far. visit stops the walk by returning false.
+func eachVorbisComment(b []byte, visit func(entry []byte) bool) {
 	if len(b) < 4 {
 		return
 	}
@@ -35,9 +36,35 @@ func parseVorbisComments(b []byte, t *Tags) {
 		if off+size > total {
 			return
 		}
-		applyVorbisTag(t, string(b[off:off+size]))
+		if !visit(b[off : off+size]) {
+			return
+		}
 		off += size
 	}
+}
+
+// parseVorbisComments records every tag in a comment payload.
+func parseVorbisComments(b []byte, t *Tags) {
+	eachVorbisComment(b, func(entry []byte) bool {
+		applyVorbisTag(t, string(entry))
+		return true
+	})
+}
+
+// findVorbisComment returns the value of one comment by key, without building a
+// string for any of the others. An embedded cover arrives this way and is
+// thousands of times larger than a tag.
+func findVorbisComment(b []byte, key string) (string, bool) {
+	var out string
+	found := false
+	eachVorbisComment(b, func(entry []byte) bool {
+		name, value, ok := bytes.Cut(entry, []byte("="))
+		if ok && strings.EqualFold(string(name), key) {
+			out, found = string(value), true
+		}
+		return !found
+	})
+	return out, found
 }
 
 // applyVorbisTag records one "KEY=value" comment. Repeated ARTIST entries
@@ -72,5 +99,7 @@ func applyVorbisTag(t *Tags, entry string) {
 		if t.Year == 0 {
 			t.Year = leadingInt(value)
 		}
+	case "LYRICS", "UNSYNCEDLYRICS", "SYNCEDLYRICS":
+		t.Lyrics = firstNonEmpty(t.Lyrics, value)
 	}
 }

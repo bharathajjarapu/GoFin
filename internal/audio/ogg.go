@@ -33,7 +33,7 @@ func readOgg(r io.ReadSeeker, size int64) (Tags, error) {
 	if n == 0 {
 		return t, ErrUnsupported
 	}
-	data := oggPayload(head[:n])
+	data := oggPayload(head[:n], oggMaxPayload)
 	var rate uint64
 	var preSkip uint64
 	switch {
@@ -59,11 +59,12 @@ func readOgg(r io.ReadSeeker, size int64) (Tags, error) {
 	return t, nil
 }
 
-// oggPayload concatenates the packet bytes of the pages in b. Header packets
-// may span pages, and joining them lets the caller search one flat buffer.
-func oggPayload(b []byte) []byte {
-	out := make([]byte, 0, min(len(b), oggMaxPayload))
-	for off := 0; off+oggPageHeader <= len(b) && len(out) < oggMaxPayload; {
+// oggPayload concatenates the packet bytes of the pages in b, up to limit.
+// Header packets may span pages, and joining them lets the caller search one
+// flat buffer.
+func oggPayload(b []byte, limit int) []byte {
+	out := make([]byte, 0, min(len(b), limit))
+	for off := 0; off+oggPageHeader <= len(b) && len(out) < limit; {
 		if string(b[off:off+4]) != "OggS" {
 			break
 		}

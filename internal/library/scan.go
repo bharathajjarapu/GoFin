@@ -17,11 +17,16 @@ import (
 )
 
 type Scanner struct {
-	Store   *store.Store
-	Meta    metadata.Client
-	scanID  string
-	series  map[string]metadata.Result
-	seasons map[string]metadata.Result
+	Store *store.Store
+	Meta  metadata.Client
+	// CoverDir caches art extracted from audio files. Leaving it empty turns
+	// embedded cover art off, which is what the tests without a database
+	// directory rely on.
+	CoverDir string
+	scanID   string
+	series   map[string]metadata.Result
+	seasons  map[string]metadata.Result
+	covers   map[string]bool
 }
 
 var videoExt = map[string]bool{"mkv": true, "mp4": true, "m4v": true, "avi": true, "mov": true, "webm": true}
@@ -51,6 +56,9 @@ func (s Scanner) ScanContext(ctx context.Context, libs []config.Library, only st
 		s.series = map[string]metadata.Result{}
 		s.seasons = map[string]metadata.Result{}
 	}
+	if s.covers == nil {
+		s.covers = map[string]bool{}
+	}
 	if s.scanID == "" {
 		s.scanID = time.Now().UTC().Format("20060102T150405.000000000Z")
 	}
@@ -78,7 +86,7 @@ func (s Scanner) ScanContext(ctx context.Context, libs []config.Library, only st
 			return err
 		}
 	}
-	return nil
+	return s.pruneCovers()
 }
 
 func (s Scanner) scanLibrary(ctx context.Context, lib store.Library) error {
@@ -275,8 +283,12 @@ func (s Scanner) upsertTrack(lib store.Library, path, rel, ext string, size, mti
 		return err
 	}
 	// The album folder holds the cover art. Jellyfin gives a file beside the
-	// media precedence over anything embedded in the track.
+	// media precedence over anything embedded in the track, and only when
+	// there is none does the track's own picture stand in.
 	if err := s.saveFolderSidecars(albumID, filepath.Dir(path)); err != nil {
+		return err
+	}
+	if err := s.saveEmbeddedArt(albumID, path); err != nil {
 		return err
 	}
 
@@ -284,7 +296,7 @@ func (s Scanner) upsertTrack(lib store.Library, path, rel, ext string, size, mti
 		Name: firstNonEmpty(tags.Title, cleanName(path)), Path: path, RelativePath: rel, Container: ext, Size: size, MTimeUnix: mtime,
 		IndexNumber: tags.Track, ParentIndexNumber: disc, RuntimeTicks: tags.DurationTicks, ProductionYear: tags.Year,
 		Album: albumName, AlbumArtist: artistName, ArtistsJSON: store.JSON(artists), GenresJSON: genreJSON(tags.Genre),
-		LastSeenScan: s.scanID}
+		HasLyrics: tags.Lyrics != "", LastSeenScan: s.scanID}
 	if err := s.Store.UpsertItem(track); err != nil {
 		return err
 	}
@@ -436,6 +448,71 @@ func (s Scanner) saveSidecars(id, video string) error {
 		if mime := imageExt[store.Ext(name)]; mime != "" && exists(name) {
 			return s.Store.UpsertImage(store.Image{ItemID: id, Type: "Primary", Path: name, Tag: store.StableID(name), Mime: mime})
 		}
+	}
+	return nil
+}
+
+// saveEmbeddedArt falls back to the cover inside a track when the album folder
+// holds no image file. The art is copied out once per album and cached beside
+// the database, so serving it later needs no audio parsing and reuses the same
+// file handling as a sidecar image. Art is optional, so a failure to extract or
+// write one never fails the scan.
+func (s Scanner) saveEmbeddedArt(albumID, path string) error {
+	if s.CoverDir == "" || s.covers[albumID] {
+		return nil
+	}
+	s.covers[albumID] = true
+	imgs, err := s.Store.Images(albumID)
+	if err != nil || len(imgs) > 0 {
+		return err
+	}
+	data, mime, err := audio.Picture(path)
+	if err != nil {
+		return nil
+	}
+	if err := os.MkdirAll(s.CoverDir, 0700); err != nil {
+		return nil
+	}
+	file := filepath.Join(s.CoverDir, albumID+audio.PictureExt(mime))
+	if err := writeCover(file, data); err != nil {
+		return nil
+	}
+	return s.Store.UpsertImage(store.Image{ItemID: albumID, Type: "Primary", Path: file,
+		Tag: store.StableID("cover", albumID, strconv.Itoa(len(data))), Mime: mime})
+}
+
+// writeCover replaces a cover atomically, so an interrupted scan cannot leave a
+// half-written image behind to be served as the album's art.
+func writeCover(path string, data []byte) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// pruneCovers deletes cached art whose album is gone, so the cache cannot grow
+// without bound as a library changes. Each file is named for its album, and a
+// leftover temporary file matches no album either.
+func (s Scanner) pruneCovers() error {
+	if s.CoverDir == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(s.CoverDir)
+	if err != nil {
+		return nil
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		id := strings.TrimSuffix(name, filepath.Ext(name))
+		if _, err := s.Store.Item(id); err == nil {
+			continue
+		}
+		_ = os.Remove(filepath.Join(s.CoverDir, name))
 	}
 	return nil
 }

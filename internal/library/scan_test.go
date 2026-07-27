@@ -397,3 +397,116 @@ func TestScanMusicSortNameAndMultipleArtists(t *testing.T) {
 		t.Fatalf("artists json = %#v", tracks)
 	}
 }
+
+// flacTrackWithArt writes a FLAC file carrying an embedded cover ahead of its
+// comment block.
+func flacTrackWithArt(t *testing.T, path string, art []byte, entries ...string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	var pic bytes.Buffer
+	binary.Write(&pic, binary.BigEndian, uint32(3)) // front cover
+	binary.Write(&pic, binary.BigEndian, uint32(len("image/jpeg")))
+	pic.WriteString("image/jpeg")
+	binary.Write(&pic, binary.BigEndian, uint32(0)) // empty description
+	pic.Write(make([]byte, 16))                     // width, height, depth, colours
+	binary.Write(&pic, binary.BigEndian, uint32(len(art)))
+	pic.Write(art)
+
+	var b bytes.Buffer
+	b.WriteString("fLaC")
+	info := make([]byte, 34)
+	binary.BigEndian.PutUint64(info[10:18], 44100<<44|44100)
+	b.WriteByte(0)
+	b.Write([]byte{0, 0, byte(len(info))})
+	b.Write(info)
+	b.WriteByte(6) // PICTURE
+	b.Write([]byte{byte(pic.Len() >> 16), byte(pic.Len() >> 8), byte(pic.Len())})
+	b.Write(pic.Bytes())
+
+	var c bytes.Buffer
+	binary.Write(&c, binary.LittleEndian, uint32(0))
+	binary.Write(&c, binary.LittleEndian, uint32(len(entries)))
+	for _, e := range entries {
+		binary.Write(&c, binary.LittleEndian, uint32(len(e)))
+		c.WriteString(e)
+	}
+	b.WriteByte(4 | 0x80)
+	b.Write([]byte{byte(c.Len() >> 16), byte(c.Len() >> 8), byte(c.Len())})
+	b.Write(c.Bytes())
+	if err := os.WriteFile(path, b.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Embedded art stands in when an album folder holds no image, a sidecar still
+// wins where there is one, and the cache is reclaimed once an album is gone.
+func TestScanMusicEmbeddedArtAndLyrics(t *testing.T) {
+	dir := t.TempDir()
+	music := filepath.Join(dir, "Music")
+	covers := filepath.Join(dir, "covers")
+	art := []byte("embedded-jpeg-bytes")
+	flacTrackWithArt(t, filepath.Join(music, "New Order", "Power", "01.flac"), art,
+		"TITLE=Blue Monday", "ALBUM=Power", "ALBUMARTIST=New Order",
+		"LYRICS=[00:01.00]How does it feel")
+	flacTrackWithArt(t, filepath.Join(music, "Aphex Twin", "Windowlicker", "01.flac"), art,
+		"TITLE=Windowlicker", "ALBUM=Windowlicker", "ALBUMARTIST=Aphex Twin")
+	sidecar := filepath.Join(music, "Aphex Twin", "Windowlicker", "cover.jpg")
+	if err := os.WriteFile(sidecar, []byte("sidecar-jpeg"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := store.Open(filepath.Join(dir, "gofin.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	libs := []config.Library{{Name: "Music", Type: "music", Path: music}}
+	if err := (Scanner{Store: s, CoverDir: covers}).ScanContext(context.Background(), libs, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	byName := map[string]store.Item{}
+	albums, err := s.Items(store.ItemQuery{Type: "MusicAlbum"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, album := range albums {
+		byName[album.Name] = album
+	}
+
+	embedded, err := s.Images(byName["Power"].ID)
+	if err != nil || len(embedded) != 1 {
+		t.Fatalf("embedded images = %#v %v", embedded, err)
+	}
+	got, err := os.ReadFile(embedded[0].Path)
+	if err != nil || !bytes.Equal(got, art) {
+		t.Fatalf("cached cover = %q %v", got, err)
+	}
+	if embedded[0].Mime != "image/jpeg" {
+		t.Fatalf("cover mime = %q", embedded[0].Mime)
+	}
+
+	// A file beside the media beats anything inside it.
+	fromFolder, err := s.Images(byName["Windowlicker"].ID)
+	if err != nil || len(fromFolder) != 1 || fromFolder[0].Path != sidecar {
+		t.Fatalf("sidecar must win: %#v %v", fromFolder, err)
+	}
+
+	tracks, err := s.Items(store.ItemQuery{Type: "Audio", Search: "Blue Monday"})
+	if err != nil || len(tracks) != 1 || !tracks[0].HasLyrics {
+		t.Fatalf("lyrics flag = %#v %v", tracks, err)
+	}
+
+	// Removing the album must reclaim its cached art.
+	if err := os.RemoveAll(filepath.Join(music, "New Order")); err != nil {
+		t.Fatal(err)
+	}
+	if err := (Scanner{Store: s, CoverDir: covers}).ScanContext(context.Background(), libs, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(embedded[0].Path); !os.IsNotExist(err) {
+		t.Fatalf("orphaned cover survived: %v", err)
+	}
+}

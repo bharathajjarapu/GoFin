@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"gofin/internal/audio"
 	"gofin/internal/config"
 	"gofin/internal/metadata"
 	"gofin/internal/store"
@@ -116,7 +117,7 @@ func (a API) Handler() http.Handler {
 	m.HandleFunc("/MusicGenres", a.musicGenres)
 	m.HandleFunc("/MusicGenres/", a.musicGenres)
 	m.HandleFunc("/Videos/", a.stream)
-	m.HandleFunc("/Audio/", a.stream)
+	m.HandleFunc("/Audio/", a.audio)
 	m.HandleFunc("/Users/", a.usersCompat)
 	return requestHeaders(requestLog(a.requireAuth(m)))
 }
@@ -888,20 +889,8 @@ func (a API) sessions(w http.ResponseWriter, r *http.Request) {
 // transcodes, so every one of them returns the same bytes and http.ServeFile
 // answers the range requests that clients seek with.
 func (a API) stream(w http.ResponseWriter, r *http.Request) {
-	_, rest, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, "/"), "/")
-	id, _, _ := strings.Cut(rest, "/")
-	id, _, _ = strings.Cut(id, ".")
-	it, err := a.S.Item(id)
-	if err != nil {
-		fail(w, err, 404)
-		return
-	}
-	if u, ok := a.userNoFail(r); !ok || !a.allowed(u, it) {
-		fail(w, nil, http.StatusForbidden)
-		return
-	}
-	if it.IsFolder || it.Path == "" {
-		http.NotFound(w, r)
+	it, ok := a.mediaItem(w, r)
+	if !ok {
 		return
 	}
 	if info, err := os.Stat(it.Path); err != nil || info.IsDir() {
@@ -917,6 +906,68 @@ func (a API) stream(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Disposition", "attachment; filename="+strconv.Quote(filepath.Base(it.Path)))
 	}
 	http.ServeFile(w, r, it.Path)
+}
+
+// mediaItem resolves the item a /Videos, /Audio or /Items download URL names
+// and reports whether the caller may have it. Every one of those paths puts the
+// id in the same position, optionally followed by a container extension.
+func (a API) mediaItem(w http.ResponseWriter, r *http.Request) (store.Item, bool) {
+	_, rest, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, "/"), "/")
+	id, _, _ := strings.Cut(rest, "/")
+	id, _, _ = strings.Cut(id, ".")
+	it, err := a.S.Item(id)
+	if err != nil {
+		fail(w, err, http.StatusNotFound)
+		return store.Item{}, false
+	}
+	if u, ok := a.userNoFail(r); !ok || !a.allowed(u, it) {
+		fail(w, nil, http.StatusForbidden)
+		return store.Item{}, false
+	}
+	if it.IsFolder || it.Path == "" {
+		http.NotFound(w, r)
+		return store.Item{}, false
+	}
+	return it, true
+}
+
+// audio splits the audio routes: everything but /Lyrics streams the file.
+func (a API) audio(w http.ResponseWriter, r *http.Request) {
+	if strings.HasSuffix(r.URL.Path, "/Lyrics") {
+		a.lyrics(w, r)
+		return
+	}
+	a.stream(w, r)
+}
+
+// lyrics returns the words embedded in a track. Clients read Start where the
+// file timed a line and scroll the text in step with playback. The text is read
+// from the file on demand rather than stored, since it is only ever wanted for
+// the one track on screen.
+func (a API) lyrics(w http.ResponseWriter, r *http.Request) {
+	it, ok := a.mediaItem(w, r)
+	if !ok {
+		return
+	}
+	tags, err := audio.Read(it.Path)
+	if err != nil || tags.Lyrics == "" {
+		http.NotFound(w, r)
+		return
+	}
+	lines := audio.ParseLyrics(tags.Lyrics)
+	if len(lines) == 0 {
+		http.NotFound(w, r)
+		return
+	}
+	out := make([]map[string]any, 0, len(lines))
+	for _, line := range lines {
+		entry := map[string]any{"Text": line.Text}
+		if line.Timed {
+			entry["Start"] = line.Start
+		}
+		out = append(out, entry)
+	}
+	write(w, map[string]any{"Metadata": map[string]any{}, "Lyrics": out})
 }
 
 // artists lists music artists, or returns one by name for /Artists/{name}.
@@ -1153,8 +1204,13 @@ func (a API) itemDTOWith(it store.Item, x itemExtras) map[string]any {
 		// scan time because the album row is written before its tracks exist.
 		m["RunTimeTicks"] = x.stat.RuntimeTicks
 	}
-	if it.Type == "Audio" && x.albumTag != "" {
-		m["AlbumPrimaryImageTag"] = x.albumTag
+	if it.Type == "Audio" {
+		if x.albumTag != "" {
+			m["AlbumPrimaryImageTag"] = x.albumTag
+		}
+		// Clients show the lyrics button from this field alone, without
+		// fetching the words for every track in a list.
+		m["HasLyrics"] = it.HasLyrics
 	}
 	if isMusic(it) {
 		addMusicFields(m, it)

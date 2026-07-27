@@ -45,7 +45,7 @@ type Item struct {
 	GenresJSON, StudiosJSON, PeopleJSON, TaglinesJSON, ExternalURLsJSON string
 	OfficialRating, Container, LastSeenScan                             string
 	Album, AlbumArtist, ArtistsJSON                                     string
-	IsFolder                                                            bool
+	IsFolder, HasLyrics                                                 bool
 	ProductionYear, IndexNumber, ParentIndexNumber                      int
 	Size, RuntimeTicks, MTimeUnix                                       int64
 	CommunityRating                                                     float64
@@ -93,7 +93,7 @@ func (s *Store) Migrate() error {
 	}
 	for _, c := range []string{
 		"genres_json TEXT", "studios_json TEXT", "people_json TEXT", "taglines_json TEXT", "external_urls_json TEXT", "community_rating REAL", "official_rating TEXT", "last_seen_scan TEXT",
-		"album TEXT", "album_artist TEXT", "artists_json TEXT",
+		"album TEXT", "album_artist TEXT", "artists_json TEXT", "has_lyrics INTEGER NOT NULL DEFAULT 0",
 	} {
 		if err := s.addColumn("items", c); err != nil {
 			return err
@@ -225,17 +225,20 @@ func (s *Store) Libraries() ([]Library, error) {
 
 func (s *Store) UpsertItem(it Item) error {
 	now := time.Now().UTC().Format(time.RFC3339)
-	folder := 0
+	folder, lyrics := 0, 0
 	if it.IsFolder {
 		folder = 1
+	}
+	if it.HasLyrics {
+		lyrics = 1
 	}
 	if it.SortName == "" {
 		it.SortName = strings.ToLower(it.Name)
 	}
-	_, err := s.DB.Exec(`INSERT INTO items(id,library_id,parent_id,type,name,sort_name,path,relative_path,is_folder,production_year,premiere_date,overview,index_number,parent_index_number,date_created,provider_ids_json,genres_json,studios_json,people_json,taglines_json,external_urls_json,community_rating,official_rating,runtime_ticks,last_seen_scan,album,album_artist,artists_json)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-			ON CONFLICT(id) DO UPDATE SET parent_id=excluded.parent_id,type=excluded.type,name=excluded.name,sort_name=excluded.sort_name,path=excluded.path,relative_path=excluded.relative_path,is_folder=excluded.is_folder,production_year=COALESCE(excluded.production_year,items.production_year),premiere_date=COALESCE(excluded.premiere_date,items.premiere_date),overview=COALESCE(excluded.overview,items.overview),index_number=COALESCE(excluded.index_number,items.index_number),parent_index_number=COALESCE(excluded.parent_index_number,items.parent_index_number),provider_ids_json=COALESCE(excluded.provider_ids_json,items.provider_ids_json),genres_json=COALESCE(excluded.genres_json,items.genres_json),studios_json=COALESCE(excluded.studios_json,items.studios_json),people_json=COALESCE(excluded.people_json,items.people_json),taglines_json=COALESCE(excluded.taglines_json,items.taglines_json),external_urls_json=COALESCE(excluded.external_urls_json,items.external_urls_json),community_rating=COALESCE(excluded.community_rating,items.community_rating),official_rating=COALESCE(excluded.official_rating,items.official_rating),runtime_ticks=COALESCE(excluded.runtime_ticks,items.runtime_ticks),last_seen_scan=COALESCE(excluded.last_seen_scan,items.last_seen_scan),album=COALESCE(excluded.album,items.album),album_artist=COALESCE(excluded.album_artist,items.album_artist),artists_json=COALESCE(excluded.artists_json,items.artists_json)`,
-		it.ID, it.LibraryID, nullEmpty(it.ParentID), it.Type, it.Name, it.SortName, nullEmpty(it.Path), nullEmpty(it.RelativePath), folder, nullZero(it.ProductionYear), nullEmpty(it.PremiereDate), nullEmpty(it.Overview), nullZero(it.IndexNumber), nullZero(it.ParentIndexNumber), now, nullEmpty(it.ProviderIDsJSON), nullEmpty(it.GenresJSON), nullEmpty(it.StudiosJSON), nullEmpty(it.PeopleJSON), nullEmpty(it.TaglinesJSON), nullEmpty(it.ExternalURLsJSON), nullFloat(it.CommunityRating), nullEmpty(it.OfficialRating), nullInt64(it.RuntimeTicks), nullEmpty(it.LastSeenScan), nullEmpty(it.Album), nullEmpty(it.AlbumArtist), nullEmpty(it.ArtistsJSON))
+	_, err := s.DB.Exec(`INSERT INTO items(id,library_id,parent_id,type,name,sort_name,path,relative_path,is_folder,production_year,premiere_date,overview,index_number,parent_index_number,date_created,provider_ids_json,genres_json,studios_json,people_json,taglines_json,external_urls_json,community_rating,official_rating,runtime_ticks,last_seen_scan,album,album_artist,artists_json,has_lyrics)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			ON CONFLICT(id) DO UPDATE SET parent_id=excluded.parent_id,type=excluded.type,name=excluded.name,sort_name=excluded.sort_name,path=excluded.path,relative_path=excluded.relative_path,is_folder=excluded.is_folder,production_year=COALESCE(excluded.production_year,items.production_year),premiere_date=COALESCE(excluded.premiere_date,items.premiere_date),overview=COALESCE(excluded.overview,items.overview),index_number=COALESCE(excluded.index_number,items.index_number),parent_index_number=COALESCE(excluded.parent_index_number,items.parent_index_number),provider_ids_json=COALESCE(excluded.provider_ids_json,items.provider_ids_json),genres_json=COALESCE(excluded.genres_json,items.genres_json),studios_json=COALESCE(excluded.studios_json,items.studios_json),people_json=COALESCE(excluded.people_json,items.people_json),taglines_json=COALESCE(excluded.taglines_json,items.taglines_json),external_urls_json=COALESCE(excluded.external_urls_json,items.external_urls_json),community_rating=COALESCE(excluded.community_rating,items.community_rating),official_rating=COALESCE(excluded.official_rating,items.official_rating),runtime_ticks=COALESCE(excluded.runtime_ticks,items.runtime_ticks),last_seen_scan=COALESCE(excluded.last_seen_scan,items.last_seen_scan),album=COALESCE(excluded.album,items.album),album_artist=COALESCE(excluded.album_artist,items.album_artist),artists_json=COALESCE(excluded.artists_json,items.artists_json),has_lyrics=excluded.has_lyrics`,
+		it.ID, it.LibraryID, nullEmpty(it.ParentID), it.Type, it.Name, it.SortName, nullEmpty(it.Path), nullEmpty(it.RelativePath), folder, nullZero(it.ProductionYear), nullEmpty(it.PremiereDate), nullEmpty(it.Overview), nullZero(it.IndexNumber), nullZero(it.ParentIndexNumber), now, nullEmpty(it.ProviderIDsJSON), nullEmpty(it.GenresJSON), nullEmpty(it.StudiosJSON), nullEmpty(it.PeopleJSON), nullEmpty(it.TaglinesJSON), nullEmpty(it.ExternalURLsJSON), nullFloat(it.CommunityRating), nullEmpty(it.OfficialRating), nullInt64(it.RuntimeTicks), nullEmpty(it.LastSeenScan), nullEmpty(it.Album), nullEmpty(it.AlbumArtist), nullEmpty(it.ArtistsJSON), lyrics)
 	if err != nil {
 		return err
 	}
@@ -271,6 +274,15 @@ func (s *Store) CleanupLibrary(libraryID, scanID string) error {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM items WHERE library_id=? AND type='Series' AND id NOT IN (SELECT parent_id FROM items WHERE type='Season' AND parent_id IS NOT NULL)`, libraryID); err != nil {
+		return err
+	}
+	// Albums and artists are folders, so the sweep above leaves them behind
+	// once their tracks are gone. Drop them the same way empty seasons and
+	// series are dropped, which also lets a scan reclaim their cached art.
+	if _, err := tx.Exec(`DELETE FROM items WHERE library_id=? AND type='MusicAlbum' AND id NOT IN (SELECT parent_id FROM items WHERE type='Audio' AND parent_id IS NOT NULL)`, libraryID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM items WHERE library_id=? AND type='MusicArtist' AND id NOT IN (SELECT parent_id FROM items WHERE type='MusicAlbum' AND parent_id IS NOT NULL)`, libraryID); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM people WHERE id NOT IN (SELECT person_id FROM item_people)`); err != nil {
@@ -1048,11 +1060,11 @@ func scanItems(rows *sql.Rows) ([]Item, error) {
 	var out []Item
 	for rows.Next() {
 		var it Item
-		var folder int
-		if err := rows.Scan(&it.ID, &it.LibraryID, &it.ParentID, &it.Type, &it.Name, &it.SortName, &it.Path, &it.RelativePath, &folder, &it.ProductionYear, &it.PremiereDate, &it.Overview, &it.IndexNumber, &it.ParentIndexNumber, &it.DateCreated, &it.ProviderIDsJSON, &it.GenresJSON, &it.StudiosJSON, &it.PeopleJSON, &it.TaglinesJSON, &it.ExternalURLsJSON, &it.CommunityRating, &it.OfficialRating, &it.RuntimeTicks, &it.LastSeenScan, &it.Album, &it.AlbumArtist, &it.ArtistsJSON, &it.Size, &it.MTimeUnix, &it.Container); err != nil {
+		var folder, lyrics int
+		if err := rows.Scan(&it.ID, &it.LibraryID, &it.ParentID, &it.Type, &it.Name, &it.SortName, &it.Path, &it.RelativePath, &folder, &it.ProductionYear, &it.PremiereDate, &it.Overview, &it.IndexNumber, &it.ParentIndexNumber, &it.DateCreated, &it.ProviderIDsJSON, &it.GenresJSON, &it.StudiosJSON, &it.PeopleJSON, &it.TaglinesJSON, &it.ExternalURLsJSON, &it.CommunityRating, &it.OfficialRating, &it.RuntimeTicks, &it.LastSeenScan, &it.Album, &it.AlbumArtist, &it.ArtistsJSON, &lyrics, &it.Size, &it.MTimeUnix, &it.Container); err != nil {
 			return nil, err
 		}
-		it.IsFolder = folder == 1
+		it.IsFolder, it.HasLyrics = folder == 1, lyrics == 1
 		out = append(out, it)
 	}
 	return out, rows.Err()
@@ -1070,7 +1082,7 @@ func scanPeople(rows *sql.Rows) ([]Person, error) {
 	return out, rows.Err()
 }
 
-const selectItem = `SELECT i.id,i.library_id,COALESCE(i.parent_id,''),i.type,i.name,i.sort_name,COALESCE(i.path,''),COALESCE(i.relative_path,''),i.is_folder,COALESCE(i.production_year,0),COALESCE(i.premiere_date,''),COALESCE(i.overview,''),COALESCE(i.index_number,0),COALESCE(i.parent_index_number,0),i.date_created,COALESCE(i.provider_ids_json,''),COALESCE(i.genres_json,''),COALESCE(i.studios_json,''),COALESCE(i.people_json,''),COALESCE(i.taglines_json,''),COALESCE(i.external_urls_json,''),COALESCE(i.community_rating,0),COALESCE(i.official_rating,''),COALESCE(i.runtime_ticks,0),COALESCE(i.last_seen_scan,''),COALESCE(i.album,''),COALESCE(i.album_artist,''),COALESCE(i.artists_json,''),COALESCE(ms.size_bytes,0),COALESCE(ms.mtime_unix,0),COALESCE(ms.container,'') FROM items i LEFT JOIN media_sources ms ON ms.item_id=i.id`
+const selectItem = `SELECT i.id,i.library_id,COALESCE(i.parent_id,''),i.type,i.name,i.sort_name,COALESCE(i.path,''),COALESCE(i.relative_path,''),i.is_folder,COALESCE(i.production_year,0),COALESCE(i.premiere_date,''),COALESCE(i.overview,''),COALESCE(i.index_number,0),COALESCE(i.parent_index_number,0),i.date_created,COALESCE(i.provider_ids_json,''),COALESCE(i.genres_json,''),COALESCE(i.studios_json,''),COALESCE(i.people_json,''),COALESCE(i.taglines_json,''),COALESCE(i.external_urls_json,''),COALESCE(i.community_rating,0),COALESCE(i.official_rating,''),COALESCE(i.runtime_ticks,0),COALESCE(i.last_seen_scan,''),COALESCE(i.album,''),COALESCE(i.album_artist,''),COALESCE(i.artists_json,''),COALESCE(i.has_lyrics,0),COALESCE(ms.size_bytes,0),COALESCE(ms.mtime_unix,0),COALESCE(ms.container,'') FROM items i LEFT JOIN media_sources ms ON ms.item_id=i.id`
 const selectPerson = `SELECT p.id,COALESCE(p.tmdb_id,0),COALESCE(p.imdb_id,''),p.name,COALESCE(p.profile_url,''),COALESCE(p.biography,''),COALESCE(p.birth_date,''),COALESCE(p.death_date,''),COALESCE(p.place_of_birth,''),COALESCE(p.known_for_department,''),p.updated_at`
 
 func StableID(parts ...string) string {

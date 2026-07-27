@@ -162,6 +162,8 @@ func applyMP4Tag(t *Tags, name string, v []byte) {
 		t.Artists = append(t.Artists, splitArtists(string(v))...)
 	case "\xa9gen":
 		t.Genre = firstNonEmpty(t.Genre, string(v))
+	case "\xa9lyr":
+		t.Lyrics = firstNonEmpty(t.Lyrics, string(v))
 	case "\xa9day":
 		if t.Year == 0 {
 			t.Year = leadingInt(string(v))

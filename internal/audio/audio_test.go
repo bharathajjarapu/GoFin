@@ -2,6 +2,7 @@ package audio
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/binary"
 	"os"
 	"path/filepath"
@@ -207,5 +208,135 @@ func TestDurationTicksRejectsImpossibleLengths(t *testing.T) {
 	}
 	if got := durationTicks(44100, 44100); got != TicksPerSecond {
 		t.Fatalf("durationTicks() = %d, want one second", got)
+	}
+}
+
+func be24(n int) []byte { return []byte{byte(n >> 16), byte(n >> 8), byte(n)} }
+
+// pictureBlock builds the FLAC PICTURE layout, which Ogg carries base64 encoded
+// inside a comment.
+func pictureBlock(mime string, data []byte) []byte {
+	var b bytes.Buffer
+	binary.Write(&b, binary.BigEndian, uint32(3)) // front cover
+	binary.Write(&b, binary.BigEndian, uint32(len(mime)))
+	b.WriteString(mime)
+	binary.Write(&b, binary.BigEndian, uint32(0)) // empty description
+	b.Write(make([]byte, pictureHeader))          // width, height, depth, colours
+	binary.Write(&b, binary.BigEndian, uint32(len(data)))
+	b.Write(data)
+	return b.Bytes()
+}
+
+// flacWithPicture puts a PICTURE block between STREAMINFO and the comments, so
+// the walk has to step over it to reach the tags.
+func flacWithPicture(picture []byte, entries ...string) []byte {
+	var b bytes.Buffer
+	b.WriteString("fLaC")
+	info := make([]byte, 34)
+	binary.BigEndian.PutUint64(info[10:18], 44100<<44|44100)
+	b.WriteByte(blockStreamInfo)
+	b.Write(be24(len(info)))
+	b.Write(info)
+	b.WriteByte(blockPicture)
+	b.Write(be24(len(picture)))
+	b.Write(picture)
+	comments := vorbisComments(entries...)
+	b.WriteByte(blockComment | 0x80)
+	b.Write(be24(len(comments)))
+	b.Write(comments)
+	return b.Bytes()
+}
+
+// mp4WithCover builds an M4A carrying a covr atom. Its data atom's type flag
+// names the image format: 13 is JPEG.
+func mp4WithCover(mime byte, art []byte, entries ...[]byte) []byte {
+	mvhd := make([]byte, 20)
+	binary.BigEndian.PutUint32(mvhd[12:16], 1000)
+	binary.BigEndian.PutUint32(mvhd[16:20], 1000)
+	covr := atom("covr", atom("data", []byte{0, 0, 0, mime, 0, 0, 0, 0}, art))
+	ilst := atom("ilst", append(entries, covr)...)
+	return atom("moov", atom("mvhd", mvhd), atom("udta", atom("meta", make([]byte, 4), ilst)))
+}
+
+func TestPictureFLAC(t *testing.T) {
+	art := []byte("jpeg-cover-bytes")
+	path := write(t, "a.flac", flacWithPicture(pictureBlock("image/jpeg", art), "TITLE=One", "LYRICS=[00:01.00]Hello"))
+	data, mime, err := Picture(path)
+	if err != nil || mime != "image/jpeg" || !bytes.Equal(data, art) {
+		t.Fatalf("picture = %q %q %v", data, mime, err)
+	}
+	// A picture block must not stop the tag walk that follows it.
+	tags, err := Read(path)
+	if err != nil || tags.Title != "One" || tags.Lyrics != "[00:01.00]Hello" {
+		t.Fatalf("tags = %#v %v", tags, err)
+	}
+}
+
+func TestPictureOpus(t *testing.T) {
+	art := []byte("png-cover-bytes")
+	encoded := base64.StdEncoding.EncodeToString(pictureBlock("image/png", art))
+	path := write(t, "a.opus", opusFile(48000, "TITLE=One", pictureComment+"="+encoded))
+	data, mime, err := Picture(path)
+	if err != nil || mime != "image/png" || !bytes.Equal(data, art) {
+		t.Fatalf("picture = %q %q %v", data, mime, err)
+	}
+}
+
+func TestPictureMP4(t *testing.T) {
+	art := []byte("jpeg-cover-bytes")
+	path := write(t, "a.m4a", mp4WithCover(13, art, tagAtom("\xa9nam", "One"), tagAtom("\xa9lyr", "Plain words")))
+	data, mime, err := Picture(path)
+	if err != nil || mime != "image/jpeg" || !bytes.Equal(data, art) {
+		t.Fatalf("picture = %q %q %v", data, mime, err)
+	}
+	tags, err := Read(path)
+	if err != nil || tags.Lyrics != "Plain words" {
+		t.Fatalf("tags = %#v %v", tags, err)
+	}
+}
+
+// Art from an untrusted file must be rejected unless it is a type the server
+// is willing to serve back, and a malformed block must not panic.
+func TestPictureRejectsUnusableArt(t *testing.T) {
+	cases := map[string][]byte{
+		"unknown mime": flacWithPicture(pictureBlock("application/octet-stream", []byte("x"))),
+		"empty image":  flacWithPicture(pictureBlock("image/jpeg", nil)),
+		"no picture":   flacFile(44100, 44100, "TITLE=One"),
+	}
+	for name, body := range cases {
+		if _, _, err := Picture(write(t, "a.flac", body)); err == nil {
+			t.Fatalf("%s: expected rejection", name)
+		}
+	}
+	full := flacWithPicture(pictureBlock("image/jpeg", []byte("cover")), "TITLE=One")
+	for n := range full {
+		func() {
+			defer func() {
+				if p := recover(); p != nil {
+					t.Fatalf("panic on %d truncated bytes: %v", n, p)
+				}
+			}()
+			_, _, _ = Picture(write(t, "a.flac", full[:n]))
+		}()
+	}
+}
+
+func TestParseLyrics(t *testing.T) {
+	lines := ParseLyrics("[ar:Someone]\r\n[00:12.50]First\n\n[01:00]Second\nPlain\n")
+	if len(lines) != 3 {
+		t.Fatalf("lines = %#v", lines)
+	}
+	// 12.5s and 60s, in hundred-nanosecond ticks.
+	if !lines[0].Timed || lines[0].Start != 125000000 || lines[0].Text != "First" {
+		t.Fatalf("first = %#v", lines[0])
+	}
+	if lines[1].Start != 600000000 || lines[1].Text != "Second" {
+		t.Fatalf("second = %#v", lines[1])
+	}
+	if lines[2].Timed || lines[2].Text != "Plain" {
+		t.Fatalf("third = %#v", lines[2])
+	}
+	if got := ParseLyrics("just words"); len(got) != 1 || got[0].Timed {
+		t.Fatalf("unsynced = %#v", got)
 	}
 }

@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -773,4 +774,42 @@ func TestMusicClientFields(t *testing.T) {
 		t.Fatalf("genre = %#v", genre)
 	}
 	status(t, h, http.MethodGet, "/MusicGenres/Nope", head, nil, http.StatusNotFound)
+}
+
+// flacWithLyrics writes a FLAC whose single metadata block carries lyrics.
+func flacWithLyrics(t *testing.T, path, lyrics string) {
+	t.Helper()
+	entry := "LYRICS=" + lyrics
+	var c bytes.Buffer
+	binary.Write(&c, binary.LittleEndian, uint32(0))
+	binary.Write(&c, binary.LittleEndian, uint32(1))
+	binary.Write(&c, binary.LittleEndian, uint32(len(entry)))
+	c.WriteString(entry)
+	var b bytes.Buffer
+	b.WriteString("fLaC")
+	b.WriteByte(4 | 0x80)
+	b.Write([]byte{byte(c.Len() >> 16), byte(c.Len() >> 8), byte(c.Len())})
+	b.Write(c.Bytes())
+	must(t, os.WriteFile(path, b.Bytes(), 0600))
+}
+
+func TestAudioLyrics(t *testing.T) {
+	s, dir := musicStore(t)
+	defer s.Close()
+	flacWithLyrics(t, filepath.Join(dir, "01.flac"), "[00:01.00]How does it feel")
+	h := API{C: config.Config{Server: config.Server{ID: "server-1"}}, S: s}.Handler()
+	head := login(t, h)
+
+	lines := get(t, h, "/Audio/track/Lyrics", head, http.StatusOK)["Lyrics"].([]any)
+	if len(lines) != 1 {
+		t.Fatalf("lyrics = %#v", lines)
+	}
+	first := lines[0].(map[string]any)
+	if first["Text"] != "How does it feel" || first["Start"].(float64) != 10000000 {
+		t.Fatalf("first line = %#v", first)
+	}
+
+	// A track whose file carries no lyrics has nothing to return.
+	must(t, os.WriteFile(filepath.Join(dir, "01.flac"), []byte("fLaC"), 0600))
+	status(t, h, http.MethodGet, "/Audio/track/Lyrics", head, nil, http.StatusNotFound)
 }

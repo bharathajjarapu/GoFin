@@ -29,6 +29,7 @@ var containers = map[string]bool{"flac": true, "m4a": true, "m4b": true, "ogg": 
 // fall back to file and folder names.
 type Tags struct {
 	Title, Album, AlbumArtist, Genre string
+	Lyrics                           string
 	Artists                          []string
 	Track, Disc, Year                int
 	DurationTicks                    int64

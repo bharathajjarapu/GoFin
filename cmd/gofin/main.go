@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -149,7 +150,7 @@ func scan(ctx context.Context, args []string, errOut io.Writer) error {
 		return err
 	}
 	defer s.Close()
-	return library.Scanner{Store: s, Meta: metadata.New(c.Metadata)}.ScanContext(ctx, c.Libraries, *only)
+	return library.Scanner{Store: s, Meta: metadata.New(c.Metadata), CoverDir: coverDir(c)}.ScanContext(ctx, c.Libraries, *only)
 }
 
 func serve(ctx context.Context, args []string, errOut io.Writer) error {
@@ -207,7 +208,7 @@ var scanMu sync.Mutex
 func runScan(ctx context.Context, s *store.Store, c config.Config, meta metadata.Client) error {
 	scanMu.Lock()
 	defer scanMu.Unlock()
-	return (library.Scanner{Store: s, Meta: meta}).ScanContext(ctx, c.Libraries, "")
+	return (library.Scanner{Store: s, Meta: meta, CoverDir: coverDir(c)}).ScanContext(ctx, c.Libraries, "")
 }
 
 func scanLoop(ctx context.Context, s *store.Store, c config.Config, meta metadata.Client) {
@@ -223,7 +224,7 @@ func scanLoop(ctx context.Context, s *store.Store, c config.Config, meta metadat
 			continue
 		}
 		log.Println("background scan started")
-		if err := (library.Scanner{Store: s, Meta: meta}).ScanContext(ctx, c.Libraries, ""); err != nil {
+		if err := (library.Scanner{Store: s, Meta: meta, CoverDir: coverDir(c)}).ScanContext(ctx, c.Libraries, ""); err != nil {
 			log.Println("background scan:", err)
 		}
 		log.Println("background scan finished")
@@ -233,4 +234,10 @@ func scanLoop(ctx context.Context, s *store.Store, c config.Config, meta metadat
 
 func usage(w io.Writer) {
 	fmt.Fprintln(w, "usage: gofin config init | user add | scan | serve | version")
+}
+
+// coverDir is where art extracted from audio files is cached. It sits beside
+// the database because it is derived data: deleting it costs only a rescan.
+func coverDir(c config.Config) string {
+	return filepath.Join(filepath.Dir(c.Database.Path), "covers")
 }
