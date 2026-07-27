@@ -871,3 +871,49 @@ func TestPlaylists(t *testing.T) {
 	// Media is not deletable through the same route.
 	status(t, h, http.MethodDelete, "/Items/track", head, nil, http.StatusNotFound)
 }
+
+func TestSimilarGenresStudiosAndRefresh(t *testing.T) {
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "gofin.db"))
+	must(t, err)
+	defer s.Close()
+	must(t, s.SaveLibraries([]store.Library{{ID: "lib", Name: "Movies", Type: "movies", Path: dir}}))
+	must(t, s.AddUserPolicy("admin", "pass", true, false, 0))
+	villeneuve := `[{"Name":"Denis Villeneuve","Role":"Director","Type":"Director"}]`
+	must(t, s.UpsertItem(store.Item{ID: "m1", LibraryID: "lib", ParentID: "lib", Type: "Movie", Name: "Dune",
+		GenresJSON: `["Science Fiction"]`, StudiosJSON: `["Legendary"]`, PeopleJSON: villeneuve, ProductionYear: 2021}))
+	must(t, s.UpsertItem(store.Item{ID: "m2", LibraryID: "lib", ParentID: "lib", Type: "Movie", Name: "Arrival",
+		GenresJSON: `["Science Fiction"]`, StudiosJSON: `["Paramount"]`, PeopleJSON: villeneuve, ProductionYear: 2016}))
+	must(t, s.UpsertItem(store.Item{ID: "m3", LibraryID: "lib", ParentID: "lib", Type: "Movie", Name: "Paddington",
+		GenresJSON: `["Comedy"]`, StudiosJSON: `["StudioCanal"]`, ProductionYear: 2014}))
+
+	refreshed := ""
+	h := API{C: config.Config{Server: config.Server{ID: "server-1"}}, S: s,
+		Refresh: func(id string) error { refreshed = id; return nil }}.Handler()
+	head := login(t, h)
+
+	// A shared genre and director should beat sharing nothing.
+	similar := get(t, h, "/Items/m1/Similar", head, http.StatusOK)
+	if count(similar) != 1 || firstID(similar) != "m2" {
+		t.Fatalf("similar = %#v", similar)
+	}
+
+	genres := get(t, h, "/Genres", head, http.StatusOK)
+	if count(genres) != 2 {
+		t.Fatalf("genres = %#v", genres)
+	}
+	if one := get(t, h, "/Genres/Comedy", head, http.StatusOK); one["Type"] != "Genre" || one["Name"] != "Comedy" {
+		t.Fatalf("genre = %#v", one)
+	}
+	status(t, h, http.MethodGet, "/Genres/Nope", head, nil, http.StatusNotFound)
+
+	if studios := get(t, h, "/Studios", head, http.StatusOK); count(studios) != 3 {
+		t.Fatalf("studios = %#v", studios)
+	}
+
+	// Refresh used to answer 204 without doing anything.
+	status(t, h, http.MethodPost, "/Items/m1/Refresh", head, nil, http.StatusNoContent)
+	if refreshed != "m1" {
+		t.Fatalf("refresh did not reach the scanner, got %q", refreshed)
+	}
+}

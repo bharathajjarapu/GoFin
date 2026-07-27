@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -48,10 +49,9 @@ var providerRe = regexp.MustCompile(`(?i)\[(tmdbid|imdbid|tvdbid)-([^\]]+)\]`)
 // metadataNoMatch records that a metadata lookup was attempted without a match.
 const metadataNoMatch = "{}"
 
-func (s Scanner) ScanContext(ctx context.Context, libs []config.Library, only string) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
+// init fills the per-run caches. The receiver is a value, so the maps it sets
+// are shared with every method this run calls in turn.
+func (s *Scanner) init() {
 	if s.series == nil {
 		s.series = map[string]metadata.Result{}
 		s.seasons = map[string]metadata.Result{}
@@ -62,6 +62,13 @@ func (s Scanner) ScanContext(ctx context.Context, libs []config.Library, only st
 	if s.scanID == "" {
 		s.scanID = time.Now().UTC().Format("20060102T150405.000000000Z")
 	}
+}
+
+func (s Scanner) ScanContext(ctx context.Context, libs []config.Library, only string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.init()
 	allLibs := make([]store.Library, 0, len(libs))
 	var slibs []store.Library
 	for _, l := range libs {
@@ -87,6 +94,49 @@ func (s Scanner) ScanContext(ctx context.Context, libs []config.Library, only st
 		}
 	}
 	return s.pruneCovers()
+}
+
+// RefreshItem re-indexes the file behind one item and re-fetches its metadata.
+// It is what a client's "refresh metadata" runs, and it deliberately bypasses
+// the size-and-mtime check a scan uses, because the point of asking is that the
+// stored metadata is wrong even though the file has not moved.
+func (s Scanner) RefreshItem(ctx context.Context, itemID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.init()
+	it, err := s.Store.Item(itemID)
+	if err != nil {
+		return err
+	}
+	if it.Path == "" {
+		return fs.ErrNotExist
+	}
+	libraries, err := s.Store.Libraries()
+	if err != nil {
+		return err
+	}
+	i := slices.IndexFunc(libraries, func(l store.Library) bool { return l.ID == it.LibraryID })
+	if i < 0 {
+		return fs.ErrNotExist
+	}
+	lib := libraries[i]
+	info, err := os.Stat(it.Path)
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(filepath.Clean(lib.Path), it.Path)
+	if err != nil {
+		return err
+	}
+	ext := store.Ext(it.Path)
+	switch lib.Type {
+	case "music":
+		return s.upsertTrack(lib, it.Path, rel, ext, info.Size(), info.ModTime().Unix())
+	case "tvshows":
+		return s.upsertEpisode(lib, it.Path, rel, ext, info.Size(), info.ModTime().Unix())
+	}
+	return s.upsertMovie(lib, it.Path, rel, ext, info.Size(), info.ModTime().Unix())
 }
 
 func (s Scanner) scanLibrary(ctx context.Context, lib store.Library) error {

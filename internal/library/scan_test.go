@@ -510,3 +510,35 @@ func TestScanMusicEmbeddedArtAndLyrics(t *testing.T) {
 		t.Fatalf("orphaned cover survived: %v", err)
 	}
 }
+
+// Refreshing one item must re-read its file even though a scan would have
+// skipped it, which is the whole point of asking for a refresh.
+func TestRefreshItemRereadsTags(t *testing.T) {
+	dir := t.TempDir()
+	music := filepath.Join(dir, "Music")
+	track := filepath.Join(music, "New Order", "Power", "01.flac")
+	flacTrack(t, track, "TITLE=Wrong Title", "ALBUM=Power", "ALBUMARTIST=New Order")
+
+	s, err := store.Open(filepath.Join(dir, "gofin.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	libs := []config.Library{{Name: "Music", Type: "music", Path: music}}
+	if err := (Scanner{Store: s}).ScanContext(context.Background(), libs, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	id := store.StableID("item", track)
+	flacTrack(t, track, "TITLE=Blue Monday", "ALBUM=Power", "ALBUMARTIST=New Order")
+	if err := (Scanner{Store: s}).RefreshItem(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	it, err := s.Item(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if it.Name != "Blue Monday" {
+		t.Fatalf("name = %q, want the retagged title", it.Name)
+	}
+}

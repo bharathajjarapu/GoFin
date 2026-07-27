@@ -182,8 +182,12 @@ func serve(ctx context.Context, args []string, errOut io.Writer) error {
 	}
 	log.Println("listening on", c.Server.Address)
 	server := &http.Server{
-		Addr:              c.Server.Address,
-		Handler:           httpapi.API{C: c, S: s, Meta: meta}.Handler(),
+		Addr: c.Server.Address,
+		Handler: httpapi.API{C: c, S: s, Meta: meta, Refresh: func(itemID string) error {
+			scanMu.Lock()
+			defer scanMu.Unlock()
+			return library.Scanner{Store: s, Meta: meta, CoverDir: coverDir(c)}.RefreshItem(ctx, itemID)
+		}}.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       time.Minute,
 		MaxHeaderBytes:    1 << 20,

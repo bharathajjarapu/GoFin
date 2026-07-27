@@ -24,9 +24,13 @@ import (
 )
 
 type API struct {
-	C       config.Config
-	S       *store.Store
-	Meta    metadata.Client
+	C    config.Config
+	S    *store.Store
+	Meta metadata.Client
+	// Refresh re-indexes one item, backing the client action of the same name.
+	// It is a function rather than a scanner so that this package does not
+	// depend on the one that scans. A nil Refresh makes the route a no-op.
+	Refresh func(itemID string) error
 	limiter *loginLimiter
 }
 
@@ -118,6 +122,10 @@ func (a API) Handler() http.Handler {
 	m.HandleFunc("/Playlists/", a.playlists)
 	m.HandleFunc("/MusicGenres", a.musicGenres)
 	m.HandleFunc("/MusicGenres/", a.musicGenres)
+	m.HandleFunc("/Genres", a.genres)
+	m.HandleFunc("/Genres/", a.genres)
+	m.HandleFunc("/Studios", a.studios)
+	m.HandleFunc("/Studios/", a.studios)
 	m.HandleFunc("/Videos/", a.stream)
 	m.HandleFunc("/Audio/", a.audio)
 	m.HandleFunc("/Users/", a.usersCompat)
@@ -450,11 +458,14 @@ func (a API) item(w http.ResponseWriter, r *http.Request) {
 			// already parses for /Videos and /Audio.
 			a.stream(w, r)
 			return
-		case "Similar", "LocalTrailers", "SpecialFeatures":
+		case "Similar":
+			a.similar(w, r, id)
+			return
+		case "LocalTrailers", "SpecialFeatures":
 			write(w, page([]map[string]any{}, 0))
 			return
 		case "Refresh":
-			w.WriteHeader(http.StatusNoContent)
+			a.refresh(w, r, id)
 			return
 		}
 	}
@@ -1033,45 +1044,6 @@ func (a API) artists(w http.ResponseWriter, r *http.Request) {
 	write(w, page(a.itemDTOs(a.allowedItems(u, items), u.ID), a.total(u, query, items)))
 }
 
-// musicGenres lists the genres present on music items, which clients offer as
-// a browse axis alongside artists and albums, and resolves one by name so that
-// tapping a genre opens it instead of 404ing.
-func (a API) musicGenres(w http.ResponseWriter, r *http.Request) {
-	u, _ := a.userNoFail(r)
-	name, err := url.PathUnescape(strings.Trim(strings.TrimPrefix(r.URL.Path, "/MusicGenres"), "/"))
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
-	items, err := a.S.Items(store.ItemQuery{Type: "MusicAlbum,Audio"})
-	if err != nil {
-		fail(w, err, http.StatusInternalServerError)
-		return
-	}
-	genres := a.filterGenres(u, items)
-	if name != "" {
-		for _, g := range genres {
-			if strings.EqualFold(g, name) {
-				write(w, a.genreDTO(g, "MusicGenre"))
-				return
-			}
-		}
-		http.NotFound(w, r)
-		return
-	}
-	out := make([]map[string]any, 0, len(genres))
-	for _, g := range genres {
-		out = append(out, a.genreDTO(g, "MusicGenre"))
-	}
-	write(w, page(out, len(out)))
-}
-
-// genreDTO renders a genre as the folder-shaped item a client browses into.
-func (a API) genreDTO(name, typ string) map[string]any {
-	return map[string]any{"Name": name, "Id": store.StableID("name", name), "Type": typ,
-		"ServerId": a.C.Server.ID, "IsFolder": true, "ImageTags": map[string]string{}}
-}
-
 func (a API) persons(w http.ResponseWriter, r *http.Request) {
 	p := strings.TrimPrefix(r.URL.Path, "/Persons/")
 	parts := strings.Split(strings.Trim(p, "/"), "/")
@@ -1526,19 +1498,30 @@ func (a API) allowedCount(u store.User, items []store.Item) int {
 	}
 	return n
 }
-func (a API) filterGenres(u store.User, items []store.Item) []string {
+
+// distinctNames collects the unique values a list-valued field takes across the
+// items a user is allowed to see.
+func (a API) distinctNames(u store.User, items []store.Item, field func(store.Item) []string) []string {
 	seen := map[string]bool{}
 	for _, it := range items {
 		if !a.allowed(u, it) {
 			continue
 		}
-		for _, g := range stringsJSON(it.GenresJSON) {
-			if g != "" {
-				seen[g] = true
+		for _, value := range field(it) {
+			if value != "" {
+				seen[value] = true
 			}
 		}
 	}
 	return sortedKeys(seen)
+}
+
+func (a API) filterGenres(u store.User, items []store.Item) []string {
+	return a.distinctNames(u, items, func(it store.Item) []string { return stringsJSON(it.GenresJSON) })
+}
+
+func (a API) filterStudios(u store.User, items []store.Item) []string {
+	return a.distinctNames(u, items, func(it store.Item) []string { return stringsJSON(it.StudiosJSON) })
 }
 func (a API) filterRatings(u store.User, items []store.Item) []string {
 	seen := map[string]bool{}
