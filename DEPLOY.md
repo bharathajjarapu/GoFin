@@ -116,7 +116,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" \
 sudo podman build --build-arg TARGETARCH="$arch" -t gofin:local .
 ```
 
-For a published release image, replace `gofin:local` below with `ghcr.io/OWNER/gofin:VERSION`. Release images support `linux/amd64` and `linux/arm64`; Podman selects the matching image automatically.
+For a published release image, replace `gofin:local` below with `ghcr.io/bharathajjarapu/gofin:VERSION`. Release images support `linux/amd64` and `linux/arm64`; Podman selects the matching image automatically.
 
 Run once:
 
@@ -195,7 +195,7 @@ systemctl status gofin.service
 - For internet exposure, place GoFin behind a TLS reverse proxy. The server is intended for authenticated LAN use. See [Rate limiting](#rate-limiting) before you do.
 - Keep the database on local storage. Media can live on a mounted disk.
 - If your media mount is not `/srv/media`, update `RequiresMountsFor=` in the installed unit to match it.
-- Back up `/srv/gofin/gofin.db`. The `covers/` folder beside it is a cache of art pulled out of music files, so it needs no backup — deleting it costs one rescan.
+- Back up `/srv/gofin/gofin.db` together with its `gofin.db-wal` file, with the server stopped. Recent changes live in the `-wal` file until SQLite folds them into the database. The `covers/` folder beside it is a cache of art pulled out of music files, so it needs no backup — deleting it costs one rescan.
 - Use direct play friendly files (`mkv`, `mp4`, `m4v`, `avi`, `mov`, `webm`).
 - External links are already populated from TMDB/IMDb metadata when available.
 

@@ -81,15 +81,40 @@ printf '%s' 'choose-a-strong-password' | ./gofin user add --name kid --password-
 
 Rating levels: G=1, PG=2, PG-13/TV-14=3, R/TV-MA=4, NC-17=5.
 
+## Performance
+
+Same machine (4 cores), same library of 2,000 FLAC tracks, 500 movies and 200 episodes, and the same requests from 8 concurrent clients. Jellyfin 12.1.0 ran from its official image, with internet metadata and chapter/trickplay extraction turned off.
+
+| | GoFin | Jellyfin |
+|---|---|---|
+| Memory, just started | 12 MB | 327 MB |
+| Memory, idle after scan | 17 MB | 370 MB |
+| Memory, peak under load | 56 MB | 422 MB |
+| First scan | 12 s | 134 s |
+| Rescan, nothing changed | 3 s | 5 s |
+| Install size | 15 MB image | 1.7 GB image |
+| Album tracks, median | 8 ms | 98 ms |
+| Search, median | 7 ms | 103 ms |
+| Latest movies, median | 9 ms | 61 ms |
+| 100-movie grid, median | 29 ms | 78 ms |
+| 100-album grid, median | 74 ms | 123 ms |
+
+Jellyfin does more work for its numbers: it probes every file with FFmpeg and can transcode. GoFin reads only headers and tags, which is also why its scan is faster. Plex and Emby were not measured.
+
 ## Why not Jellyfin?
 
 GoFin is not a full Jellyfin replacement. It intentionally omits:
 
 - **Transcoding**
-- **FFmpeg probing** (no codec/stream analysis yet)
+- **FFmpeg probing** — no codec or stream details, so clients show no resolution or audio-track badges and leave track selection to the player
+- **Web interface** — use a client app such as Plezy
 - **Plugin system**
 - **Multiple metadata providers** (TMDB only)
 - **Fuzzy metadata matching**
+- **Live TV, DVR, SyncPlay and collections**
+- **Live updates** — no websocket, so clients see new media on their next refresh
+- **LAN discovery** — enter the server address by hand
+- **Per-user client settings** — preferences a client tries to save on the server are not kept
 
 For music specifically, it also omits:
 
