@@ -70,7 +70,7 @@ type PersonQuery struct {
 
 type ItemQuery struct {
 	ParentID, Type, Search, SortBy, SortOrder, PersonIDs, Genres, OfficialRatings, Years, NameStartsWith string
-	UserID, Name, IDs, ArtistIDs                                                                         string
+	UserID, Name, IDs, ArtistIDs, ExcludeTypes                                                           string
 	Recursive                                                                                            bool
 	Favorite, Played, Unplayed                                                                           bool
 	Start, Limit                                                                                         int
@@ -570,6 +570,12 @@ func itemFilter(q ItemQuery) (string, []any) {
 			args = append(args, t)
 		}
 	}
+	if q.ExcludeTypes != "" {
+		sqlq += ` AND i.type NOT IN (` + marks(q.ExcludeTypes) + `)`
+		for _, t := range split(q.ExcludeTypes) {
+			args = append(args, t)
+		}
+	}
 	if q.Search != "" {
 		sqlq += ` AND i.name LIKE ?`
 		args = append(args, "%"+q.Search+"%")
@@ -652,7 +658,9 @@ func itemFilter(q ItemQuery) (string, []any) {
 
 func (s *Store) Items(q ItemQuery) ([]Item, error) {
 	where, args := itemFilter(q)
-	sqlq := selectItem + ` WHERE 1=1` + where + orderBy(q.SortBy, q.SortOrder)
+	order, orderArgs := orderBy(q)
+	sqlq := selectItem + ` WHERE 1=1` + where + order
+	args = append(args, orderArgs...)
 	switch {
 	case q.Limit > 0:
 		sqlq += ` LIMIT ?`
@@ -708,13 +716,20 @@ func (s *Store) CountItemsByType(typ string) (int, error) {
 	return n, err
 }
 
-func (s *Store) Filters() (genres, ratings []string, years []int, err error) {
-	rows, err := s.DB.Query(`SELECT COALESCE(genres_json,''), COALESCE(official_rating,''), COALESCE(production_year,0) FROM items WHERE type IN ('Movie','Series','Episode')`)
+// Filters lists the genres, ratings and years found in one library, or across
+// the video libraries when libraryID is empty.
+func (s *Store) Filters(libraryID string) (genres, ratings []string, years []int, err error) {
+	q, args := `SELECT COALESCE(genres_json,''), COALESCE(official_rating,''), COALESCE(production_year,0) FROM items WHERE type IN ('Movie','Series','Episode')`, []any{}
+	if libraryID != "" {
+		q, args = `SELECT COALESCE(genres_json,''), COALESCE(official_rating,''), COALESCE(production_year,0) FROM items WHERE library_id=? AND (is_folder=0 OR type IN ('Series','MusicAlbum'))`, []any{libraryID}
+	}
+	rows, err := s.DB.Query(q, args...)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	defer rows.Close()
 	gs, rs, ys := map[string]bool{}, map[string]bool{}, map[int]bool{}
+	genres, ratings, years = []string{}, []string{}, []int{}
 	for rows.Next() {
 		var gj, rating string
 		var year int
@@ -1150,12 +1165,27 @@ func chunks(ss []string, n int) [][]string {
 	}
 	return out
 }
-func orderBy(by, dir string) string {
+
+// orderBy returns the ORDER BY clause for q and the arguments it binds. Only
+// the per-user sorts bind any: they read the caller's playback row.
+func orderBy(q ItemQuery) (string, []any) {
 	desc := ""
-	if strings.EqualFold(dir, "Descending") || strings.EqualFold(dir, "desc") {
+	if strings.EqualFold(q.SortOrder, "Descending") || strings.EqualFold(q.SortOrder, "desc") {
 		desc = " DESC"
 	}
+	switch strings.Split(q.SortBy, ",")[0] {
+	case "DatePlayed":
+		return ` ORDER BY (SELECT last_played_at FROM playback_state WHERE user_id=? AND item_id=i.id)` + desc + `, i.sort_name`, []any{q.UserID}
+	case "PlayCount":
+		return ` ORDER BY COALESCE((SELECT play_count FROM playback_state WHERE user_id=? AND item_id=i.id),0)` + desc + `, i.sort_name`, []any{q.UserID}
+	}
+	return orderByColumn(q.SortBy, desc), nil
+}
+
+func orderByColumn(by, desc string) string {
 	switch strings.Split(by, ",")[0] {
+	case "Runtime":
+		return ` ORDER BY COALESCE(i.runtime_ticks,0)` + desc + `, i.sort_name`
 	case "DateCreated":
 		return ` ORDER BY i.date_created` + desc + `, i.sort_name`
 	case "ProductionYear":

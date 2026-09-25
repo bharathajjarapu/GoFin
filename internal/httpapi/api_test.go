@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -752,6 +753,15 @@ func TestMusicClientFields(t *testing.T) {
 	if track["AlbumPrimaryImageTag"] != "covertag" {
 		t.Fatalf("track album art tag = %#v", track["AlbumPrimaryImageTag"])
 	}
+	post(t, h, "/Sessions/Playing/Progress", head, []byte(`{"ItemId":"track","PositionTicks":5000000}`), http.StatusNoContent)
+	videoResume := get(t, h, "/UserItems/Resume?MediaTypes=Video", head, http.StatusOK)
+	if count(videoResume) != 0 {
+		t.Fatalf("video resume included an audio track: %#v", videoResume)
+	}
+	audioResume := get(t, h, "/UserItems/Resume?MediaTypes=Audio", head, http.StatusOK)
+	if count(audioResume) != 1 || firstID(audioResume) != "track" {
+		t.Fatalf("audio resume = %#v", audioResume)
+	}
 
 	byArtist := get(t, h, "/Items?IncludeItemTypes=Audio&ArtistIds=artist", head, http.StatusOK)
 	if count(byArtist) != 1 || firstID(byArtist) != "track" {
@@ -774,6 +784,82 @@ func TestMusicClientFields(t *testing.T) {
 		t.Fatalf("genre = %#v", genre)
 	}
 	status(t, h, http.MethodGet, "/MusicGenres/Nope", head, nil, http.StatusNotFound)
+}
+
+// TestPlezyRequests replays the requests Plezy's Jellyfin client makes that
+// GoFin once answered with the wrong rows or the wrong shape.
+func TestPlezyRequests(t *testing.T) {
+	s, dir := musicStore(t)
+	defer s.Close()
+	cover := filepath.Join(dir, "cover.jpg")
+	must(t, os.WriteFile(cover, []byte("jpeg-bytes"), 0600))
+	must(t, s.UpsertImage(store.Image{ItemID: "album", Type: "Primary", Path: cover, Tag: "covertag", Mime: "image/jpeg"}))
+	must(t, s.UpsertItem(store.Item{ID: "album2", LibraryID: "lib", ParentID: "artist", Type: "MusicAlbum", Name: "Other", IsFolder: true}))
+	must(t, s.UpsertItem(store.Item{ID: "track2", LibraryID: "lib", ParentID: "album2", Type: "Audio", Name: "Another Song", Path: filepath.Join(dir, "01.flac"), Container: "flac"}))
+	h := API{C: config.Config{Server: config.Server{ID: "server-1"}}, S: s}.Handler()
+	head := login(t, h)
+
+	if info := get(t, h, "/System/Info/Public", nil, http.StatusOK); info["ProductName"] != "Jellyfin Server" {
+		t.Fatalf("product name = %#v", info["ProductName"])
+	}
+	// Plezy lists an album's tracks by AlbumIds, not ParentId.
+	if tracks := get(t, h, "/Items?AlbumIds=album&IncludeItemTypes=Audio&Recursive=true", head, http.StatusOK); count(tracks) != 1 || firstID(tracks) != "track" {
+		t.Fatalf("album tracks = %#v", tracks)
+	}
+	if byUser := get(t, h, "/Users/admin/Items?AlbumIds=album2", head, http.StatusOK); count(byUser) != 1 || firstID(byUser) != "track2" {
+		t.Fatalf("user-scoped items = %#v", byUser)
+	}
+	if noAudio := get(t, h, "/Items?Recursive=true&ExcludeItemTypes=Audio,MusicArtist,Folder,CollectionFolder", head, http.StatusOK); count(noAudio) != 2 {
+		t.Fatalf("exclude types = %#v", noAudio)
+	}
+	if video := get(t, h, "/Items?Recursive=true&MediaTypes=Video", head, http.StatusOK); count(video) != 0 {
+		t.Fatalf("video media type returned %#v", video)
+	}
+	// Plezy reads each library's filter sheet by ParentId.
+	if f := get(t, h, "/Items/Filters?ParentId=lib", head, http.StatusOK); fmt.Sprint(f["Genres"]) != "[Post-Punk]" || fmt.Sprint(f["Years"]) != "[1983]" {
+		t.Fatalf("music filters = %#v", f)
+	}
+
+	// Sorting by name puts "Another Song" first; the per-user sorts must not.
+	post(t, h, "/Sessions/Playing/Progress", head, []byte(`{"ItemId":"track","PositionTicks":5000000}`), http.StatusNoContent)
+	if recent := get(t, h, "/Items?IncludeItemTypes=Audio&Recursive=true&SortBy=DatePlayed&SortOrder=Descending", head, http.StatusOK); firstID(recent) != "track" {
+		t.Fatalf("date played sort = %#v", recent)
+	}
+	post(t, h, "/UserPlayedItems/track", head, nil, http.StatusOK)
+	if most := get(t, h, "/Items?IncludeItemTypes=Audio&Recursive=true&SortBy=PlayCount&SortOrder=Descending", head, http.StatusOK); firstID(most) != "track" {
+		t.Fatalf("play count sort = %#v", most)
+	}
+
+	// A track has no art of its own and borrows its album's cover.
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/Items/track/Images/Primary", nil)
+	for k, v := range head {
+		req.Header.Set(k, v)
+	}
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || w.Body.String() != "jpeg-bytes" {
+		t.Fatalf("track image = %d %q", w.Code, w.Body.String())
+	}
+
+	var ancestors []map[string]any
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/Items/track/Ancestors", nil)
+	for k, v := range head {
+		req.Header.Set(k, v)
+	}
+	h.ServeHTTP(w, req)
+	must(t, json.Unmarshal(w.Body.Bytes(), &ancestors))
+	if len(ancestors) != 1 || ancestors[0]["Id"] != "lib" || ancestors[0]["Type"] != "CollectionFolder" {
+		t.Fatalf("ancestors = %s", w.Body.String())
+	}
+	if mix := get(t, h, "/Items/track/InstantMix", head, http.StatusOK); count(mix) != 0 {
+		t.Fatalf("instant mix = %#v", mix)
+	}
+	// Routes GoFin lacks must not answer with the item or the media file.
+	status(t, h, http.MethodGet, "/Items/track/ThemeSongs", head, nil, http.StatusNotFound)
+	status(t, h, http.MethodGet, "/Videos/track/index.bif", head, nil, http.StatusNotFound)
+	status(t, h, http.MethodGet, "/Videos/track/src/Subtitles/0/Stream.srt", head, nil, http.StatusNotFound)
+	status(t, h, http.MethodGet, "/Audio/track/universal", head, nil, http.StatusOK)
 }
 
 // flacWithLyrics writes a FLAC whose single metadata block carries lyrics.

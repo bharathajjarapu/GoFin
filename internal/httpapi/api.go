@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -180,7 +181,7 @@ func (a API) css(w http.ResponseWriter, r *http.Request)             { w.Header(
 func (a API) displayPrefs(w http.ResponseWriter, r *http.Request)    { write(w, map[string]any{}) }
 func (a API) parentalRatings(w http.ResponseWriter, r *http.Request) { write(w, parentalRatings()) }
 func (a API) info() map[string]any {
-	return map[string]any{"ServerName": a.C.Server.Name, "Id": a.C.Server.ID, "LocalAddress": a.C.Server.PublicURL, "Version": "10.10.0", "ProductName": "GoFin", "OperatingSystem": "Linux", "StartupWizardCompleted": true}
+	return map[string]any{"ServerName": a.C.Server.Name, "Id": a.C.Server.ID, "LocalAddress": a.C.Server.PublicURL, "Version": "10.10.0", "ProductName": "Jellyfin Server", "OperatingSystem": "Linux", "StartupWizardCompleted": true}
 }
 
 func (a API) usersPublic(w http.ResponseWriter, r *http.Request) {
@@ -239,15 +240,44 @@ func (a API) userViews(w http.ResponseWriter, r *http.Request) {
 	}
 	items := []map[string]any{}
 	for _, l := range libs {
-		items = append(items, map[string]any{"Id": l.ID, "Name": l.Name, "ServerId": a.C.Server.ID, "Type": "CollectionFolder", "IsFolder": true, "CollectionType": jfType(l.Type), "ImageTags": map[string]string{}})
+		items = append(items, a.libraryDTO(l))
 	}
 	write(w, page(items, len(items)))
+}
+
+func (a API) libraryDTO(l store.Library) map[string]any {
+	return map[string]any{"Id": l.ID, "Name": l.Name, "ServerId": a.C.Server.ID, "Type": "CollectionFolder", "IsFolder": true, "CollectionType": jfType(l.Type), "ImageTags": map[string]string{}}
+}
+
+// ancestors names the library an item lives in. Plezy reads only the
+// CollectionFolder entry, so the folders in between are left out.
+func (a API) ancestors(w http.ResponseWriter, r *http.Request, id string) {
+	u, _ := a.userNoFail(r)
+	it, err := a.S.Item(id)
+	if err != nil || !a.allowed(u, it) {
+		http.NotFound(w, r)
+		return
+	}
+	libs, err := a.S.Libraries()
+	if err != nil {
+		fail(w, err, http.StatusInternalServerError)
+		return
+	}
+	out := []map[string]any{}
+	for _, l := range libs {
+		if l.ID == it.LibraryID {
+			out = append(out, a.libraryDTO(l))
+		}
+	}
+	write(w, out)
 }
 
 func (a API) items(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	u, _ := a.userNoFail(r)
-	query := store.ItemQuery{ParentID: q.Get("ParentId"), Type: q.Get("IncludeItemTypes"), Search: q.Get("SearchTerm"), SortBy: q.Get("SortBy"), SortOrder: q.Get("SortOrder"), PersonIDs: q.Get("PersonIds"), Genres: q.Get("Genres"), OfficialRatings: q.Get("OfficialRatings"), Years: q.Get("Years"), NameStartsWith: q.Get("NameStartsWith"), IDs: q.Get("Ids"), ArtistIDs: firstNonEmpty(q.Get("ArtistIds"), q.Get("AlbumArtistIds")), UserID: u.ID, Favorite: userFilter(q, "IsFavorite"), Played: userFilter(q, "IsPlayed"), Unplayed: userFilter(q, "IsUnplayed"), Recursive: parseBool(q.Get("Recursive")), Start: atoi(q.Get("StartIndex")), Limit: queryLimit(q.Get("Limit"))}
+	// AlbumIds names the album whose tracks a client wants; tracks are the
+	// album's children, so it is a parent filter.
+	query := store.ItemQuery{ParentID: firstNonEmpty(q.Get("AlbumIds"), q.Get("ParentId")), Type: includeTypes(q), ExcludeTypes: q.Get("ExcludeItemTypes"), Search: q.Get("SearchTerm"), SortBy: q.Get("SortBy"), SortOrder: q.Get("SortOrder"), PersonIDs: q.Get("PersonIds"), Genres: q.Get("Genres"), OfficialRatings: q.Get("OfficialRatings"), Years: q.Get("Years"), NameStartsWith: q.Get("NameStartsWith"), IDs: q.Get("Ids"), ArtistIDs: firstNonEmpty(q.Get("ArtistIds"), q.Get("AlbumArtistIds")), UserID: u.ID, Favorite: userFilter(q, "IsFavorite"), Played: userFilter(q, "IsPlayed"), Unplayed: userFilter(q, "IsUnplayed"), Recursive: parseBool(q.Get("Recursive")), Start: atoi(q.Get("StartIndex")), Limit: queryLimit(q.Get("Limit"))}
 	items, err := a.S.Items(query)
 	if err != nil {
 		fail(w, err, 500)
@@ -461,13 +491,20 @@ func (a API) item(w http.ResponseWriter, r *http.Request) {
 		case "Similar":
 			a.similar(w, r, id)
 			return
-		case "LocalTrailers", "SpecialFeatures":
+		case "LocalTrailers", "SpecialFeatures", "InstantMix":
 			write(w, page([]map[string]any{}, 0))
 			return
 		case "Refresh":
 			a.refresh(w, r, id)
 			return
+		case "Ancestors":
+			a.ancestors(w, r, id)
+			return
 		}
+		// Anything else under an item is a route GoFin lacks. Answering
+		// with the item itself would hand a client the wrong shape.
+		http.NotFound(w, r)
+		return
 	}
 	if r.Method == http.MethodDelete {
 		// Only playlists are deletable: media leaves the library by leaving
@@ -513,16 +550,24 @@ func (a API) playbackInfo(w http.ResponseWriter, r *http.Request, id string) {
 
 func (a API) images(w http.ResponseWriter, r *http.Request, id string, parts []string) {
 	u, _ := a.userNoFail(r)
+	var audioAlbumID string
 	if it, err := a.S.Item(id); err == nil {
 		if !a.allowed(u, it) {
 			http.NotFound(w, r)
 			return
+		}
+		if it.Type == "Audio" {
+			audioAlbumID = it.ParentID
 		}
 	} else if person, err := a.S.PersonByID(id); err == nil && !a.personAllowed(u, person.ID) {
 		http.NotFound(w, r)
 		return
 	}
 	imgs, err := a.S.Images(id)
+	if err == nil && len(imgs) == 0 && audioAlbumID != "" {
+		// Cover art is stored against the album, so a track shows its album's.
+		imgs, err = a.S.Images(audioAlbumID)
+	}
 	if err != nil {
 		fail(w, err, 500)
 		return
@@ -630,12 +675,30 @@ func (a API) libraryType(id string) string {
 func (a API) resume(w http.ResponseWriter, r *http.Request) {
 	u, _ := a.userNoFail(r)
 	q := r.URL.Query()
-	items, err := a.S.Resume(u.ID, q.Get("ParentId"), q.Get("IncludeItemTypes"), firstInt(q.Get("Limit"), 16))
+	items, err := a.S.Resume(u.ID, q.Get("ParentId"), includeTypes(q), firstInt(q.Get("Limit"), 16))
 	if err != nil {
 		fail(w, err, 500)
 		return
 	}
 	write(w, page(a.itemDTOs(a.allowedItems(u, items), u.ID), len(items)))
+}
+
+// includeTypes reads IncludeItemTypes, falling back to the item types behind
+// MediaTypes, which clients send instead when they mean "anything playable".
+func includeTypes(q url.Values) string {
+	if types := q.Get("IncludeItemTypes"); types != "" {
+		return types
+	}
+	var types []string
+	for _, mediaType := range strings.Split(q.Get("MediaTypes"), ",") {
+		switch strings.ToLower(strings.TrimSpace(mediaType)) {
+		case "audio":
+			types = append(types, "Audio")
+		case "video":
+			types = append(types, "Movie", "Episode", "Video", "MusicVideo", "Trailer")
+		}
+	}
+	return strings.Join(types, ",")
 }
 
 func (a API) shows(w http.ResponseWriter, r *http.Request) {
@@ -714,8 +777,9 @@ func (a API) counts(w http.ResponseWriter, r *http.Request) {
 }
 func (a API) filters(w http.ResponseWriter, r *http.Request) {
 	u, _ := a.userNoFail(r)
+	parentID := r.URL.Query().Get("ParentId")
 	if !u.IsChild {
-		genres, ratings, years, err := a.S.Filters()
+		genres, ratings, years, err := a.S.Filters(parentID)
 		if err != nil {
 			fail(w, err, 500)
 			return
@@ -723,7 +787,11 @@ func (a API) filters(w http.ResponseWriter, r *http.Request) {
 		write(w, map[string]any{"Genres": genres, "Tags": []string{}, "OfficialRatings": ratings, "Years": years})
 		return
 	}
-	items, err := a.S.Items(store.ItemQuery{Type: "Movie,Series,Episode"})
+	query := store.ItemQuery{Type: "Movie,Series,Episode"}
+	if parentID != "" {
+		query = store.ItemQuery{ParentID: parentID, Recursive: true}
+	}
+	items, err := a.S.Items(query)
 	if err != nil {
 		fail(w, err, 500)
 		return
@@ -930,6 +998,14 @@ func (a API) sessions(w http.ResponseWriter, r *http.Request) {
 // transcodes, so every one of them returns the same bytes and http.ServeFile
 // answers the range requests that clients seek with.
 func (a API) stream(w http.ResponseWriter, r *http.Request) {
+	// Subtitle, trickplay and BIF routes share the /Videos/{id}/ prefix; the
+	// whole media file is never a valid answer to them.
+	switch last := path.Base(r.URL.Path); {
+	case last == "stream", strings.HasPrefix(last, "stream."), strings.HasPrefix(last, "universal"), last == "Download":
+	default:
+		http.NotFound(w, r)
+		return
+	}
 	it, ok := a.mediaItem(w, r)
 	if !ok {
 		return
@@ -1139,6 +1215,10 @@ func (a API) usersCompat(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasSuffix(p, "/Items/Latest") {
 		a.latest(w, r)
+		return
+	}
+	if strings.HasSuffix(p, "/Items") {
+		a.items(w, r)
 		return
 	}
 	if strings.Contains(p, "/FavoriteItems/") {
