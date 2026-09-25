@@ -952,7 +952,8 @@ func (s *Store) AddUserPolicy(name, pass string, admin, child bool, maxRating in
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	a, c := 0, 0
-	if admin {
+	// Administrators bypass parental limits, so a child account is never one.
+	if admin && !child {
 		a = 1
 	}
 	if child {

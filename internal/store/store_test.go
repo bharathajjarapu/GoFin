@@ -163,3 +163,23 @@ func BenchmarkItemsBrowse(b *testing.B) {
 		}
 	}
 }
+
+// Administrators bypass parental limits, so asking for a child admin (the
+// CLI's --admin defaults to true) must still produce a restricted account.
+func TestChildIsNeverAdmin(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "gofin.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.AddUserPolicy("kid", "pass", true, true, 3); err != nil {
+		t.Fatal(err)
+	}
+	users, err := s.PublicUsers()
+	if err != nil || len(users) != 1 {
+		t.Fatalf("users = %#v, %v", users, err)
+	}
+	if u := users[0]; u.IsAdmin || !u.IsChild || u.MaxParentalRating != 3 {
+		t.Fatalf("kid = %#v", u)
+	}
+}
