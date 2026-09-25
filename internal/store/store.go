@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -77,11 +78,17 @@ type ItemQuery struct {
 }
 
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)")
+	// WAL with synchronous=NORMAL commits without a disk sync, which a scan
+	// making thousands of small writes needs. It can lose the last commits
+	// on power loss, never the database, and a rescan restores them. WAL also
+	// lets readers run beside each other and beside the one writer, so a
+	// client's parallel home-screen requests stop queueing; immediate
+	// transactions make writers wait their turn instead of failing busy.
+	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_txlock=immediate")
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1)
+	db.SetMaxOpenConns(runtime.NumCPU())
 	s := &Store{DB: db}
 	return s, s.Migrate()
 }
