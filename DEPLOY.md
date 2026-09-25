@@ -1,12 +1,10 @@
 # Deploy GoFin
 
-Use either deployment path below. The same `Dockerfile` works with Podman: a Dockerfile is the image recipe, and Podman can build it without running the Docker daemon.
-
-For a small home server, direct systemd is the fewest moving parts. Podman is cleaner if you want container isolation and easier migration to another machine. Install Go first using the build instructions below only when building the direct systemd binary or a local container image. Release images already contain the server binary.
+Run GoFin as a plain systemd service, or in a Podman container. Systemd has fewer parts. Podman isolates the server and moves to another machine more easily. Release images already contain the binary, so you need Go only to build it yourself.
 
 ## Build and run
 
-This project requires Go 1.26 or newer. On Debian/Ubuntu, install the distribution package and confirm that it meets that requirement:
+GoFin needs Go 1.26 or newer. On Debian or Ubuntu:
 
 ```sh
 sudo apt update
@@ -14,7 +12,7 @@ sudo apt install -y golang-go
 go version
 ```
 
-If `go version` is older than 1.26, install the official Go 1.26 archive instead (use the matching archive for your CPU architecture):
+If that version is older than 1.26, install the official archive for your CPU:
 
 ```sh
 GO_ARCHIVE=go1.26.5.linux-amd64.tar.gz
@@ -26,22 +24,15 @@ echo 'export PATH=/usr/local/go/bin:$PATH' >> ~/.profile
 go version
 ```
 
-Build the development binary from the repository root:
+Build the binary and create a config. `config init` writes a unique server ID. Keep it when you edit the file.
 
 ```sh
 go build -o gofin ./cmd/gofin
-```
-
-Create folders for your media and generate the initial configuration. `config init` creates a unique, persistent server ID; keep that ID when editing the file.
-
-```sh
 mkdir -p media/movies media/tv
 ./gofin config init
 ```
 
-Edit `gofin.json` with the library paths from the [configuration reference](README.md#configuration). Use absolute paths and place movie files in `media/movies` and TV episodes in `media/tv`; see [Recommended naming](README.md#recommended-naming).
-
-Start a local server after setting your TMDB key and creating the first administrator:
+Set the library paths in `gofin.json` as shown in the [configuration reference](README.md#configuration), and name files as in [Naming](README.md#naming). Then add an administrator, scan and serve:
 
 ```sh
 export TMDB_API_KEY="your-tmdb-key"
@@ -50,24 +41,24 @@ export TMDB_API_KEY="your-tmdb-key"
 ./gofin serve --config gofin.json
 ```
 
-Open `http://127.0.0.1:8096` locally, or `http://SERVER-IP:8096` from another device on your LAN.
+Open `http://127.0.0.1:8096`, or `http://SERVER-IP:8096` from another device.
 
-## Shared layout
+## Server layout
 
-Examples below use:
+The examples below use these paths:
 
 ```text
-/srv/gofin/gofin.json  # config
-/srv/gofin/gofin.db    # SQLite database
-/srv/gofin/gofin.env   # secrets
-/srv/gofin/covers/         # cover art extracted from music files
-/srv/media/movies              # movies
-/srv/media/tv                  # TV shows
+/srv/gofin/gofin.json   # config
+/srv/gofin/gofin.db     # SQLite database
+/srv/gofin/gofin.env    # secrets
+/srv/gofin/covers/      # cover art copied out of music files
+/srv/media/movies       # movies
+/srv/media/tv           # TV shows
 ```
 
-If your hard disk is mounted somewhere else, use that path instead. For example, if `/dev/sdb1` is mounted at `/mnt/media`, set the media paths to `/mnt/media/movies` and `/mnt/media/tv` for direct systemd, or mount `/mnt/media:/media:ro` for Podman.
+If your media disk is mounted elsewhere, such as `/mnt/media`, use that path for systemd, or mount `/mnt/media:/media:ro` for Podman.
 
-Create the app directory and secret file:
+Create the directories and the secrets file:
 
 ```sh
 sudo mkdir -p /srv/gofin /srv/media/movies /srv/media/tv
@@ -77,7 +68,7 @@ EOF
 sudo chmod 600 /srv/gofin/gofin.env
 ```
 
-Example config for Podman:
+Config for Podman:
 
 ```json
 {
@@ -92,7 +83,7 @@ Example config for Podman:
 }
 ```
 
-For direct systemd, use the same config but set:
+For systemd, change these fields:
 
 ```json
 "database": { "path": "/srv/gofin/gofin.db" },
@@ -102,11 +93,11 @@ For direct systemd, use the same config but set:
 ]
 ```
 
-Save the final config at `/srv/gofin/gofin.json`.
+Save the config as `/srv/gofin/gofin.json`.
 
 ## Podman
 
-The Dockerfile is runtime-only: it copies a static binary from `dist/gofin_linux_<architecture>` into a small distroless image. Build that binary first when testing an image locally:
+The image copies a static binary from `dist/gofin_linux_<arch>` into a distroless base. To build it locally:
 
 ```sh
 arch=$(go env GOARCH)
@@ -116,9 +107,9 @@ CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" \
 sudo podman build --build-arg TARGETARCH="$arch" -t gofin:local .
 ```
 
-For a published release image, replace `gofin:local` below with `ghcr.io/bharathajjarapu/gofin:VERSION`. Release images support `linux/amd64` and `linux/arm64`; Podman selects the matching image automatically.
+To use a release instead, replace `gofin:local` below with `ghcr.io/bharathajjarapu/gofin:VERSION`. Releases cover `linux/amd64` and `linux/arm64`.
 
-Run once:
+Run it once:
 
 ```sh
 sudo chown -R 65532:65532 /srv/gofin
@@ -131,7 +122,7 @@ sudo podman run --rm \
   gofin:local
 ```
 
-Install as a system service with Quadlet:
+Or install it as a service with Quadlet:
 
 ```sh
 sudo chown -R 65532:65532 /srv/gofin
@@ -141,29 +132,20 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now gofin.service
 ```
 
-If your media disk is mounted at `/mnt/media`, edit `/etc/containers/systemd/gofin.container` and change:
+If your media is not in `/srv/media`, change the `Volume=` line in `/etc/containers/systemd/gofin.container`, for example to `Volume=/mnt/media:/media:ro`.
 
-```text
-Volume=/mnt/media:/media:ro
-```
+## Systemd
 
-## Direct systemd
-
-Build and install the binary:
+Install the binary and create a service account that owns `/srv/gofin`:
 
 ```sh
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o gofin ./cmd/gofin
 sudo install -m 0755 gofin /usr/local/bin/gofin
-```
-
-Create a service user and give it the app directory:
-
-```sh
 sudo useradd --system --home /srv/gofin --shell /usr/sbin/nologin gofin
 sudo chown -R gofin:gofin /srv/gofin
 ```
 
-Create the first GoFin administrator with the installed binary. This is the account that signs in from a Jellyfin-compatible client; it is separate from the Linux `gofin` service account.
+Add the first GoFin administrator. Clients sign in with this account. It is separate from the `gofin` Linux account.
 
 ```sh
 printf '%s' 'choose-a-strong-password' | sudo -u gofin /usr/local/bin/gofin user add \
@@ -172,42 +154,31 @@ printf '%s' 'choose-a-strong-password' | sudo -u gofin /usr/local/bin/gofin user
   --password-stdin
 ```
 
-Make sure the `gofin` user can read your media folders. Then install and start the service. It will scan the configured Movies and TV Shows paths on startup when `"on_start": true` is set in the config:
+Give the `gofin` user read access to your media, then start the service. With `"on_start": true` it scans on startup.
 
 ```sh
 sudo cp deploy/gofin.service /etc/systemd/system/gofin.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now gofin.service
-```
-
-Check it:
-
-```sh
 curl http://127.0.0.1:8096/System/Info/Public
-systemctl status gofin.service
 ```
 
 ## Production notes
 
-- Tags matching `v*` trigger GitHub Actions to publish static `linux/amd64` and `linux/arm64` binaries, plus a multi-architecture image to GitHub Container Registry.
-- The container image has no Go compiler, shell, package manager, or Alpine runtime. It includes the static binary and CA certificates needed for TMDB HTTPS requests.
-- Keep `TMDB_API_KEY` in `/srv/gofin/gofin.env`, not in the config file.
-- For internet exposure, place GoFin behind a TLS reverse proxy. The server is intended for authenticated LAN use. See [Rate limiting](#rate-limiting) before you do.
+- Pushing a `v*` tag makes GitHub Actions publish `linux/amd64` and `linux/arm64` binaries and a multi-architecture image to GitHub Container Registry.
+- The image holds only the static binary and the CA certificates TMDB needs. It has no shell or package manager.
+- Keep `TMDB_API_KEY` in `/srv/gofin/gofin.env`, not in the config.
+- GoFin has no TLS. Put it behind a TLS reverse proxy before exposing it to the internet, and read [Rate limiting](#rate-limiting) first. See [SECURITY.md](SECURITY.md) for the rest.
 - Keep the database on local storage. Media can live on a mounted disk.
-- If your media mount is not `/srv/media`, update `RequiresMountsFor=` in the installed unit to match it.
-- Back up `/srv/gofin/gofin.db` together with its `gofin.db-wal` file, with the server stopped. Recent changes live in the `-wal` file until SQLite folds them into the database. The `covers/` folder beside it is a cache of art pulled out of music files, so it needs no backup — deleting it costs one rescan.
-- Use direct play friendly files (`mkv`, `mp4`, `m4v`, `avi`, `mov`, `webm`).
-- External links are already populated from TMDB/IMDb metadata when available.
+- If your media is not in `/srv/media`, update `RequiresMountsFor=` in the installed unit.
+- Stop the server, then back up `gofin.db` together with `gofin.db-wal`. The `-wal` file holds recent changes until SQLite merges them. `covers/` needs no backup, because a rescan rebuilds it.
+- Use files clients can play directly, such as `mkv`, `mp4`, `m4v`, `avi`, `mov` or `webm`. GoFin does not transcode.
 
 ## Rate limiting
 
-`POST /Users/AuthenticateByName` allows **10 attempts per client IP per minute**. Attempts beyond that get `429 Too Many Requests` with a `Retry-After` header holding the seconds left in the window. The counter resets a minute after the first attempt in the window, so a locked-out client recovers on its own. Successful and failed logins both count.
+`POST /Users/AuthenticateByName` allows 10 attempts per client IP per minute, counting both successes and failures. Further attempts get `429 Too Many Requests` with a `Retry-After` header. The count resets a minute after the first attempt. GoFin tracks at most 1024 IPs, and when every one of them is still active it rejects new logins.
 
-The limiter tracks at most 1024 client IPs at a time. Once full it drops entries older than a minute; if every entry is still live it rejects new logins rather than growing without bound.
-
-Only the login endpoint is limited. Every other endpoint requires a token, so it is already closed to anonymous callers.
-
-**Behind a reverse proxy this limiter stops working as intended.** It keys on the connection's remote address, and it does not read `X-Forwarded-For`, so every request appears to come from the proxy. All clients then share one 10-per-minute bucket and a single attacker locks out the whole household. If you terminate TLS at a proxy, rate limit the login endpoint there instead, keyed on the real client IP:
+Behind a reverse proxy, every request comes from the proxy's IP, because GoFin does not read `X-Forwarded-For`. All clients then share one limit, and one attacker can lock out the household. Rate limit the login at the proxy instead:
 
 ```nginx
 limit_req_zone $binary_remote_addr zone=gofin_login:10m rate=10r/m;
@@ -217,4 +188,3 @@ location /Users/AuthenticateByName {
     proxy_pass http://127.0.0.1:8096;
 }
 ```
-- Transcoding is intentionally not included. Adding it means FFmpeg, media probing, larger images, more CPU, and more Jellyfin API behavior.
